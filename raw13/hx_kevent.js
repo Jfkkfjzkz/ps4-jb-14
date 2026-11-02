@@ -20,6 +20,7 @@ const TPL_HI = 0x54545454;
 const DEV_DCE = "/dev/dce";
 const OPS_OFF = 0x985a;
 
+// Exact 30 CANDS from Hx1400.java
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
 
@@ -319,9 +320,9 @@ export async function runKevent(c) {
 
   ensureStubs();
 
-  // FD BURNER - increased to 350 to push dce into the right memory zone
+  // FD BURNER - set to 250 to safely avoid memory exhaustion
   const burn = [];
-  for (let i = 0; i < 350; i++) {
+  for (let i = 0; i < 250; i++) {
     const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
     if (fd >= 0) burn.push(fd);
   }
