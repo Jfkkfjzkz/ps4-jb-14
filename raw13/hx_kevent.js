@@ -12,6 +12,7 @@ import { HX1400_TABLES } from "./hx_tables.js";
 // v3: runtime libkernel rescan for stubs the stage-1 scanner missed.
 // v4: if rescan fails, SYNTHESIZE missing stubs: copy close(6) stub into RWX
 //     jitshm memory (jitshm_create=533), patch syscall number, register it.
+// v5: x86-64 stub scanner/synth (PS4 is x86-64, not AArch64).
 // ============================================================================
 
 const T = HX1400_TABLES;
@@ -70,45 +71,61 @@ function allocBuf(size) {
 }
 function zeroBuf(buf) { new Uint8Array(buf.ab).fill(0); }
 
-// --- stub resolution: stage-1 map -> libkernel rescan -> jitshm synth ---
-// Orbis syscall stub shape: mov w8|x8, #num ; svc #0 ; ret
-const SVC_INS = 0xd4000001;
+// --- stub resolution (x86-64, PS4/FreeBSD) ---
+// Orbis syscall stub shape:
+//    48 c7 c0 <imm32 LE>   mov rax, <syscall number>
+//    0f 05                 syscall
+//    c3                    ret
+// PS4 kernel is x86-64. This mirrors main.js's stage-1 scan.
 let SCAN_SEEN = 0;
+
 function findStubRaw(snum) {
   const p = ctx().p;
   const base = num(ctx().libkernelBase);
-  const movW = (0x52800000 | ((snum & 0xffff) << 5) | 8) >>> 0;
-  const movX = (0xd2800000 | ((snum & 0xffff) << 5) | 8) >>> 0;
-  const LIMIT = 0x80000; // 512KB of libkernel (v3's 128KB was not enough)
+  const want = snum >>> 0;
+  const LIMIT = 0x80000; // 512KB of libkernel .text
   for (let off = 0; off < LIMIT; off += 4) {
     const w = p.read4(toI64(base + BigInt(off))) >>> 0;
-    const top = w & 0xffe00000;
-    if ((w === movW || w === movX)) {
-      for (let k = 1; k <= 8; k++) {
-        if ((p.read4(toI64(base + BigInt(off + 4 * k))) >>> 0) === SVC_INS)
-          return base + BigInt(off);
+    if ((w & 0x00ffffff) !== 0xc0c748) continue;
+    const b3 = p.read1(toI64(base + BigInt(off + 4)));
+    const b4 = p.read1(toI64(base + BigInt(off + 5)));
+    const b5 = p.read1(toI64(base + BigInt(off + 6)));
+    const imm = (((w >>> 24) & 0xff) | (b3 << 8) | (b4 << 16) | (b5 << 24)) >>> 0;
+    let isStub = false;
+    for (let k = 7; k <= 15; k++) {
+      if (p.read1(toI64(base + BigInt(off + k))) === 0x0f &&
+          p.read1(toI64(base + BigInt(off + k + 1))) === 0x05) {
+        isStub = true;
+        break;
       }
     }
-    // sanity counter: any movz w8/x8 imm;svc pair
-    if ((top === 0x52800000 || top === 0xd2800000) && ((w & 0x1f) === 8)) {
-      for (let k = 1; k <= 3; k++) {
-        if ((p.read4(toI64(base + BigInt(off + 4 * k))) >>> 0) === SVC_INS) { SCAN_SEEN++; break; }
-      }
-    }
+    if (!isStub) continue;
+    SCAN_SEEN++;
+    if (imm === want) return base + BigInt(off);
   }
   return null;
 }
 
-// Build a missing stub in RWX jitshm memory from the close(6) donor.
 function synthStub(targetNum) {
   const donorNum = NUM.close !== targetNum ? NUM.close : NUM.socket;
   const daddr = num(ctx().stubAddr.get(donorNum));
   const p = ctx().p;
-  const w0 = p.read4(toI64(daddr)) >>> 0;
-  const top = w0 & 0xffe00000;
-  const imm = (w0 >> 5) & 0xffff;
-  if ((top !== 0xd2800000 && top !== 0x52800000) || imm !== donorNum || (w0 & 0x1f) !== 8)
-    return { err: "donor " + donorNum + " ins0=0x" + w0.toString(16) + " not movz" };
+
+  if (p.read1(toI64(daddr)) !== 0x48 ||
+      p.read1(toI64(daddr + 1n)) !== 0xc7 ||
+      p.read1(toI64(daddr + 2n)) !== 0xc0) {
+    return { err: "donor " + donorNum + " not 48 c7 c0" };
+  }
+  const donorImm = (
+    p.read1(toI64(daddr + 3n)) |
+    (p.read1(toI64(daddr + 4n)) << 8) |
+    (p.read1(toI64(daddr + 5n)) << 16) |
+    (p.read1(toI64(daddr + 6n)) << 24)
+  ) >>> 0;
+  if (donorImm !== donorNum) {
+    return { err: "donor imm=" + donorImm + " != " + donorNum };
+  }
+
   let jfd = scn("jitshm_create", 0, 16384, 7);
   let usedName = false;
   if (jfd < 0) {
@@ -118,17 +135,28 @@ function synthStub(targetNum) {
     usedName = true;
   }
   if (jfd < 0) return { err: "jitshm_create rc=" + jfd };
+
   const m = scn64("mmap", 0, 16384, 7, 1, jfd, 0); // MAP_SHARED
   const addr = (BigInt(m.hi >>> 0) << 32n) | BigInt(m.lo >>> 0);
   if (addr < 0x10000n) return { err: "mmap jit rc=" + m.i32 };
-  if (typeof p.write4 !== "function") return { err: "p.write4 missing" };
-  const patched = (top | ((targetNum & 0xffff) << 5) | 8) >>> 0;
-  p.write4(toI64(addr), patched);
-  p.write4(toI64(addr + 4n), p.read4(toI64(daddr + 4n)) >>> 0);
-  p.write4(toI64(addr + 8n), p.read4(toI64(daddr + 8n)) >>> 0);
-  p.write4(toI64(addr + 12n), p.read4(toI64(daddr + 12n)) >>> 0);
+
+  // copy 32 bytes of donor, then patch the imm32 at bytes 3..6
+  for (let o = 0; o < 32; o += 4) {
+    p.write4(toI64(addr + BigInt(o)), p.read4(toI64(daddr + BigInt(o))) >>> 0);
+  }
+  const w1 = ((((targetNum & 0xff) << 24) >>> 0) | 0x00c0c748) >>> 0;
+  p.write4(toI64(addr), w1);
+  const tailByte0 = p.read1(toI64(daddr + 7n));
+  const w2 = (
+    ((targetNum >>> 8) & 0xff) |
+    (((targetNum >>> 16) & 0xff) << 8) |
+    (((targetNum >>> 24) & 0xff) << 16) |
+    (tailByte0 << 24)
+  ) >>> 0;
+  p.write4(toI64(addr + 4n), w2);
+
   log("NATIVES-SYNTH", "num=" + targetNum + " donor=" + donorNum +
-      " ins0=0x" + w0.toString(16) + "->0x" + patched.toString(16) +
+      " imm=" + donorImm + "->" + targetNum +
       " jfd=" + jfd + (usedName ? "(namebuf)" : "") + " rwx=" + h16(addr));
   return { addr };
 }
