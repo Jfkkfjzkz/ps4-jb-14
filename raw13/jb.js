@@ -223,6 +223,9 @@ function check(name, ok, detail) {
 const SYS = {
   getpid: 20,
   getuid: 0x18,
+  read: 3,
+  write: 4,
+  open: 5,
   close: 6,
   socket: 97,
   socketpair: 0x87,
@@ -240,14 +243,14 @@ const SYS = {
   getegid: 43,
   aio_multi_wait: 663,
   aio_multi_cancel: 666,
-    aio_submit_cmd: 669,
-  write: 4,
+  aio_submit_cmd: 669,
   sysctl: 202,
   kill: 37,
   getppid: 39,
   kqueue: 362,
   kevent: 363,
   jitshm_create: 533,
+  fstat: 189,
 };
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
 const keepAlive = [];
