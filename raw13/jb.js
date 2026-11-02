@@ -1143,11 +1143,14 @@ let allDone = false,
               return;
             }
             try { sessionStorage.removeItem("kv-kbase-retry"); } catch (e) {}
-            const kvb = await import("./hx_kevent.js?v=3");
+            
+            // FIXED: bumped to v=16 and passed `off: off`
+            const kvb = await import("./hx_kevent.js?v=16");
             const kvOk = await kvb.runKevent({
               p: p, sc: sc, callAddr: callAddr, bufAddr: bufAddr, errno: errno,
               webkitBase: webkitBase, libkernelBase: libkernelBase, G: G,
               stubAddr: stubAddr, int64: int64, params: params, keepAlive: keepAlive,
+              off: off, 
               mark: mark, trace: trace, state: state, check: check,
               fetchFile: async function (path) {
                 const response = await fetch(path);
